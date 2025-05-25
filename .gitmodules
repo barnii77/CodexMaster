@@ -1,0 +1,3 @@
+[submodule "third_party/codex-headless"]
+	path = third_party/codex-headless
+	url = https://github.com/barnii77/codex-headless

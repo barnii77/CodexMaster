@@ -15,8 +15,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Only allow these Discord user IDs to interact with the bot.
+# You can list them in the ALLOWED_USER_IDS env var (comma-separated).
+allowed_ids_env = os.getenv("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="", intents=intents)
+
+
+# Global pre-check: only allow listed users to run slash commands
+@bot.check
+async def globally_allow_only_listed_users(ctx: commands.Context) -> bool:
+    if ctx.author.id not in ALLOWED_USER_IDS:
+        await ctx.respond("⛔ You are not authorized to use this bot.", ephemeral=True)
+        return False
+    return True
+
 
 # Mapping of spawn IDs to channel, user, and active processes
 spawns: dict[str, dict] = {}
@@ -193,6 +208,10 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
+        return
+
+    # Drop all messages from users not on the allow-list
+    if message.author.id not in ALLOWED_USER_IDS:
         return
 
     # Parse bot mention pattern: <@bot_id> to spawn_id: prompt

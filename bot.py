@@ -18,6 +18,7 @@ load_dotenv()
 # Only allow these Discord user IDs to interact with the bot.
 # You can list them in the ALLOWED_USER_IDS env var (comma-separated).
 allowed_ids_env = os.getenv("ALLOWED_USER_IDS", "")
+DEBUG = int(os.getenv("DEBUG", 0))
 ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
 
 intents = discord.Intents.default()
@@ -163,9 +164,6 @@ def format_command_output(msg: str) -> str:
 
 def send_codex_notification(worker_entry: dict, notification: bytes, reference=None):
     msg = notification.decode('utf-8')
-    # TODO remove
-    send_notification(worker_entry, msg)
-    return
     messages = [msg]
     try:
         content = json.loads(msg)
@@ -244,9 +242,15 @@ async def on_message(message: discord.Message):
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
 
     async def reader():
+        if DEBUG:
+            print("Spawning process", file=sys.stderr)
         async for line in proc.stdout:
+            if DEBUG:
+                print("New line from process", file=sys.stderr)
             send_codex_notification(entry, line.strip(), reference=message)
         send_notification(entry, f"WORKER '{spawn_id}' FINISHED!", critical=True, reference=message)
+        if DEBUG:
+            print("Retiring process", file=sys.stderr)
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 

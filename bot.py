@@ -6,6 +6,7 @@ import json
 import asyncio
 import sys
 import traceback
+import datetime
 
 import discord
 from discord import option, AutocompleteContext
@@ -67,9 +68,11 @@ async def spawn(
 
 @bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
 @option("spawn_id", description="The spawn ID to kill processes for")
+@option("delete", description="Delete it fully?", type=bool)
 async def kill(
     ctx: discord.ApplicationContext,
-    spawn_id: str
+    spawn_id: str,
+    delete: bool,
 ):
     """Kills all active processes associated with the given spawn ID."""
     if spawn_id not in spawns:
@@ -78,16 +81,52 @@ async def kill(
     procs = spawns[spawn_id]["processes"]
     if not procs:
         await ctx.respond(f"ℹ️ No active processes for spawn ID '{spawn_id}'.", ephemeral=True)
+        if delete:
+            del spawns[spawn_id]
         return
     count = 0
-    for proc in procs:
+    for item in procs:
         try:
-            proc.kill()
+            item["proc"].kill()
             count += 1
         except Exception:
             pass
     spawns[spawn_id]["processes"] = []
+    if delete:
+        del spawns[spawn_id]
     await ctx.respond(f"✅ Killed {count} process(es) for spawn ID '{spawn_id}'.", ephemeral=True)
+
+
+@bot.slash_command(name="list", description="List active workers and their processes with PID and runtime")
+async def list_spawns(
+    ctx: discord.ApplicationContext
+):
+    """Lists all spawn IDs and their active processes, showing PID and runtime."""
+    if not spawns:
+        await ctx.respond("ℹ️ No spawn workers registered.", ephemeral=True)
+        return
+    now = datetime.datetime.now()
+    lines: list[str] = []
+    for sid, entry in spawns.items():
+        procs = entry["processes"]
+        if procs:
+            lines.append(f"**{sid}**:")
+            for item in procs:
+                p = item["proc"]
+                delta = now - item["start_time"]
+                secs = int(delta.total_seconds())
+                h, rem = divmod(secs, 3600)
+                m, s = divmod(rem, 60)
+                if h:
+                    elapsed = f"{h}h{m}m{s}s"
+                elif m:
+                    elapsed = f"{m}m{s}s"
+                else:
+                    elapsed = f"{s}s"
+                lines.append(f" • PID {p.pid} – running for {elapsed}")
+        else:
+            lines.append(f"**{sid}**: no active processes")
+    await ctx.respond("\n".join(lines), ephemeral=True)
 
 
 def format_response(msg: str) -> str:
@@ -107,7 +146,7 @@ def format_command_output(msg: str) -> str:
     return f'```\n{msg}\n```'
 
 
-def send_codex_notification(worker_entry: dict, notification: bytes):
+def send_codex_notification(worker_entry: dict, notification: bytes, reference=None):
     msg = notification.decode('utf-8')
     # TODO remove
     send_notification(worker_entry, msg)
@@ -141,13 +180,13 @@ def send_codex_notification(worker_entry: dict, notification: bytes):
         print(traceback.format_exc(), file=sys.stderr)
 
     for m in messages:
-        send_notification(worker_entry, m)
+        send_notification(worker_entry, m, reference=reference)
 
 
-def send_notification(worker_entry: dict, notification: str, critical: bool = False):
+def send_notification(worker_entry: dict, notification: str, critical: bool = False, reference=None):
     channel, user_id, spawn_id = worker_entry["channel"], worker_entry["user"].id, worker_entry["spawn_id"]
     ping = f"<@{user_id}> " if critical else ""
-    coro = channel.send(f"{ping}from {spawn_id}:\n{notification}")
+    coro = channel.send(f"{ping}from {spawn_id}:\n{notification}", reference=reference)
     asyncio.run_coroutine_threadsafe(coro, bot.loop)
 
 
@@ -177,22 +216,18 @@ async def on_message(message: discord.Message):
         prompt,
         "--update-session-file=false",
     ]
-    proc = subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1
-    )
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT
     )
     assert proc.stdout is not None
-    entry["processes"].append(proc)
+    entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
 
     async def reader():
         async for line in proc.stdout:
-            send_codex_notification(entry, line.strip())
-        send_notification(entry, f"WORKER '{spawn_id}' FINISHED!", critical=True)
+            send_codex_notification(entry, line.strip(), reference=message)
+        send_notification(entry, f"WORKER '{spawn_id}' FINISHED!", critical=True, reference=message)
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 

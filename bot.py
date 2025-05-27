@@ -1,6 +1,4 @@
 import os
-import subprocess
-import threading
 import re
 import json
 import asyncio
@@ -10,7 +8,7 @@ import datetime
 import uuid
 
 import discord
-from discord import option, AutocompleteContext
+from discord import option
 from discord.ext import commands
 from dotenv import load_dotenv
 from typing import Optional
@@ -68,7 +66,7 @@ except FileNotFoundError:
 # that the process reader should not save the aborted session updates to the session file (i.e. revert)
 newly_killed_procs = []
 
-instructions = "You are Codex, a highly autonomous AI coding agent that lives in the terminal. You help users by comlpeting tasks they assign you, e.g. writing, testing or debugging code or doing research for them."
+instructions = "You are Codex, a highly autonomous AI coding agent that lives in the terminal. You help users by completing tasks they assign you, e.g. writing, testing or debugging code or doing research for them."
 
 # Set up directory structure
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
@@ -119,9 +117,6 @@ def get_session_file_path(session_id: str) -> str:
 
 def write_session_file(session_id: str, items: list[dict]):
     path = get_session_file_path(session_id)
-    if os.path.exists(path):
-        return
-
     # remove messages that will be ignored
     filtered_items = []
     for item in items:
@@ -151,6 +146,7 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
     """Sets the instructions on which ALL Agents operate."""
     global instructions
     instructions = new_instructions
+    await ctx.respond("✅ Instructions updated")
 
 
 @bot.slash_command(name="spawn", description="Reserve a spawn ID for Codex prompts")
@@ -202,7 +198,7 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
 @bot.slash_command(name="set_provider", description="Change the provider for an already existing Agent")
 @option("spawn_id", description="The ID of the Agent")
 @option("provider", description="The Provider to use")
-async def set_provider(spawn_id: str, provider: str = DEFAULT_PROVIDER):
+async def set_provider(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER):
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
         return
@@ -212,18 +208,20 @@ async def set_provider(spawn_id: str, provider: str = DEFAULT_PROVIDER):
     entry = spawns[spawn_id]
     entry["provider"] = provider
     save_spawns()
+    await ctx.respond(f"✅ Provider for '{spawn_id}' set to '{provider}'.", ephemeral=True)
 
 
 @bot.slash_command(name="set_model", description="Change the model for an already existing Agent")
 @option("spawn_id", description="The ID of the Agent")
 @option("model", description="The model to use")
-async def set_model(spawn_id: str, model: str = DEFAULT_MODEL):
+async def set_model(ctx: discord.ApplicationContext, spawn_id: str, model: str = DEFAULT_MODEL):
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
         return
     entry = spawns[spawn_id]
     entry["model"] = model
     save_spawns()
+    await ctx.respond(f"✅ Model for '{spawn_id}' set to '{model}'.", ephemeral=True)
 
 
 @bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
@@ -382,7 +380,7 @@ def build_codex_launch_cmd(
         optional_docker_prefix = []
         cli_script_abspath = os.path.join(BOT_WORKING_DIR, cli_script_relpath)
     else:
-        api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys]
+        api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys.items()]
         env_var_setters = []
         for ev in api_key_env_var_kvs:
             env_var_setters.append("-e")
@@ -391,8 +389,8 @@ def build_codex_launch_cmd(
             "docker",
             "run",
             "--rm",
-            "-v", "{working_dir}:~",
-            "-v", "{SESSIONS_DIR}:~/.codex/sessions",
+            "-v", f"{working_dir}:~",
+            "-v", f"{SESSIONS_DIR}:~/.codex/sessions",
             *env_var_setters,
             CODEX_CONTAINER_NAME,
         ]

@@ -524,3 +524,4 @@ if __name__ == "__main__":
         print("Error: DISCORD_BOT_TOKEN environment variable not set.")
         exit(1)
     bot.run(token)
+

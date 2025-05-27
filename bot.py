@@ -23,13 +23,22 @@ allowed_ids_env = os.getenv("ALLOWED_USER_IDS", "")
 DEBUG = int(os.getenv("DEBUG", 0))
 ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
 
+BOT_WORKING_DIR = os.getcwd()
 ALLOWED_PROVIDERS = os.getenv("ALLOWED_PROVIDERS", "openai").split(',')
 DEFAULT_WORKING_DIR = os.path.expanduser(os.getenv("DEFAULT_WORKING_DIR", os.getcwd()))
+assert ':' not in DEFAULT_WORKING_DIR
 DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest")
 assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
-# TODO use this -> actually run in docker (-> install docker!!)
+
 NO_DOCKER = int(os.getenv("NO_DOCKER", 0))
+CODEX_CONTAINER_NAME = os.getenv("CODEX_CONTAINER_NAME")
+assert NO_DOCKER or CODEX_CONTAINER_NAME is not None
+
+all_api_keys = {}
+for k, v in os.environ.items():
+    if k.endswith('_API_KEY'):
+        all_api_keys[k] = v
 
 with open("session_json_template.json") as f:
     session_json_template = json.load(f)
@@ -54,6 +63,10 @@ try:
         spawns = json.load(f)
 except FileNotFoundError:
     pass
+
+# Used by the kill command to communicate to the process reader that the process was killed and
+# that the process reader should not save the aborted session updates to the session file (i.e. revert)
+newly_killed_procs = []
 
 instructions = "You are Codex, a highly autonomous AI coding agent that lives in the terminal. You help users by comlpeting tasks they assign you, e.g. writing, testing or debugging code or doing research for them."
 
@@ -157,6 +170,12 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
             f"❌ Provider '{provider}' is not allowed.", ephemeral=True
         )
         return
+    working_dir = os.path.expanduser(working_dir)
+    if ':' in working_dir:
+        await ctx.respond(
+                f"❌ Working Dir '{working_dir}' must not contain ':'", ephemeral=True
+        )
+        return
     if not os.path.exists(working_dir) or not os.path.isdir(working_dir):
         await ctx.respond(
             f"❌ Working Dir '{working_dir}' does not exist.", ephemeral=True
@@ -169,6 +188,7 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
         "session_id": session_id,
         "provider": provider,
         "model": model,
+        "working_dir": working_dir,
         "channel": ctx.channel,
         "user": ctx.author,
         "processes": []
@@ -224,7 +244,9 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
     count = 0
     for item in procs:
         try:
-            item["proc"].kill()
+            proc = item["proc"]
+            proc.kill()
+            newly_killed_procs.append(proc)
             count += 1
         except Exception:
             pass
@@ -348,6 +370,49 @@ def get_history_item_content(item: dict):
     return item.get('content') or item.get('summary') or item.get('output') or item['action']['command']
 
 
+def build_codex_launch_cmd(
+    prompt: str,
+    session_id: str,
+    provider: str,
+    model: str,
+    working_dir: str,
+) -> list[str]:
+    cli_script_relpath = "third_party/codex-headless/dist/cli.mjs"
+    if NO_DOCKER:
+        optional_docker_prefix = []
+        cli_script_abspath = os.path.join(BOT_WORKING_DIR, cli_script_relpath)
+    else:
+        api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys]
+        env_var_setters = []
+        for ev in api_key_env_var_kvs:
+            env_var_setters.append("-e")
+            env_var_setters.append(ev)
+        optional_docker_prefix = [
+            "docker",
+            "run",
+            "--rm",
+            "-v", "{working_dir}:~",
+            "-v", "{SESSIONS_DIR}:~/.codex/sessions",
+            *env_var_setters,
+            CODEX_CONTAINER_NAME,
+        ]
+        cli_script_abspath = cli_script_relpath  # within docker
+
+    return optional_docker_prefix + [
+        "node",
+        cli_script_abspath,
+        "-q",
+        prompt,
+        "--session-id",
+        session_id,
+        "--full-auto",
+        "--provider",
+        provider,
+        "-m",
+        model,
+    ]
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -378,31 +443,23 @@ async def on_message(message: discord.Message):
     provider = entry.get('provider', DEFAULT_PROVIDER)
     if provider not in ALLOWED_PROVIDERS:
         provider = DEFAULT_PROVIDER
-    args = [
-        "node",
-        "third_party/codex-headless/dist/cli.mjs",
-        "-q",
-        prompt,
-        "--session-id",
-        session_id,
-        "--full-auto",
-        "--provider",
-        provider,
-        "-m",
-        entry.get("model", DEFAULT_MODEL),
-    ]
+    model = entry.get("model", DEFAULT_MODEL)
+    working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
+    args = build_codex_launch_cmd(prompt, session_id, provider, model, working_dir)
 
     sess_fp = get_session_file_path(session_id)
     if not os.path.exists(sess_fp):
         init_session_file(session_id)
     with open(sess_fp) as f:
         sess = json.load(f)
-    prev_sess_items = sess['items'].copy()
+    prev_sess_items_og = sess['items'].copy()
+    prev_sess_items = prev_sess_items_og.copy()
 
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        cwd=working_dir,
     )
     assert proc.stdout is not None
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
@@ -450,8 +507,13 @@ async def on_message(message: discord.Message):
         await proc.wait()
 
         # Overwrite the auto-updated sessions file manually to remove messages the cli ignores.
-        # Example: empty reasoning summary messages
-        write_session_file(session_id, notifications)
+        # Example: empty reasoning summary messages.
+        # However, revert content if we were killed
+        if proc in newly_killed_procs:
+            newly_killed_procs.remove(proc)
+            write_session_file(session_id, prev_sess_items_og)
+        else:
+            write_session_file(session_id, notifications)
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 

@@ -227,7 +227,8 @@ async def set_model(ctx: discord.ApplicationContext, spawn_id: str, model: str =
 @bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
 @option("spawn_id", description="The spawn ID to kill processes for")
 @option("delete", description="Delete it fully?", type=bool)
-async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False):
+@option("revert_chat_state", description="Revert the chat state to before you sent your last message?", type=bool)
+async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False, revert_chat_state: bool = True):
     """Kills all active processes associated with the given spawn ID."""
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
@@ -244,7 +245,9 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
         try:
             proc = item["proc"]
             proc.kill()
-            newly_killed_procs.append(proc)
+            if revert_chat_state:
+                # Signals to the reader of the proc that the proc was killed
+                newly_killed_procs.append(proc)
             count += 1
         except Exception:
             pass

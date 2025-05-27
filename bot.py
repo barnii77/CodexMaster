@@ -13,6 +13,7 @@ import discord
 from discord import option, AutocompleteContext
 from discord.ext import commands
 from dotenv import load_dotenv
+from typing import Optional
 
 load_dotenv()
 
@@ -21,6 +22,14 @@ load_dotenv()
 allowed_ids_env = os.getenv("ALLOWED_USER_IDS", "")
 DEBUG = int(os.getenv("DEBUG", 0))
 ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
+
+ALLOWED_PROVIDERS = os.getenv("ALLOWED_PROVIDERS", "openai").split(',')
+DEFAULT_WORKING_DIR = os.path.expanduser(os.getenv("DEFAULT_WORKING_DIR", os.getcwd()))
+DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest")
+assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
+# TODO use this -> actually run in docker (-> install docker!!)
+NO_DOCKER = int(os.getenv("NO_DOCKER", 0))
 
 with open("session_json_template.json") as f:
     session_json_template = json.load(f)
@@ -95,34 +104,62 @@ def get_session_file_path(session_id: str) -> str:
     return os.path.expanduser(f'~/.codex/sessions/rollout-date-elided-{session_id}.json')
 
 
-def init_session_file(session_id: str):
+def write_session_file(session_id: str, items: list[dict]):
     path = get_session_file_path(session_id)
     if os.path.exists(path):
         return
+
+    # remove messages that will be ignored
+    filtered_items = []
+    for item in items:
+        if (item.get('type') not in ('message', 'reasoning', 'local_shell_call', 'local_shell_call_output') or 
+            item.get('type') == 'reasoning' and not item.get('summary', [])):
+            continue
+        filtered_items.append(item)
+    items = filtered_items
+
     content = session_json_template.copy()
     content['session']['id'] = session_id
     timestamp = datetime.datetime.now().isoformat('T', 'milliseconds') + 'Z'
     content['session']['timestamp'] = timestamp
     content['session']['instructions'] = instructions
+    content['items'] = items
     with open(path, 'w') as f:
         json.dump(content, f)
 
 
-@bot.slash_command(name="set_instructions", description="Sets the instructions that will be passed to all Codex Agents spawned from now on")
+def init_session_file(session_id: str):
+    write_session_file(session_id, [])
+
+
+@bot.slash_command(name="set_instructions", description="Sets the instructions that will be passed to ALL Codex Agents spawned from now on")
 @option("new_instructions", description="The new instructions")
 async def set_instructions(ctx: discord.ApplicationContext, new_instructions: str):
-    """Sets the instructions on which Agents operate."""
+    """Sets the instructions on which ALL Agents operate."""
     global instructions
     instructions = new_instructions
 
 
 @bot.slash_command(name="spawn", description="Reserve a spawn ID for Codex prompts")
 @option("spawn_id", description="The ID under which you will reference the Codex Instance")
-async def spawn(ctx: discord.ApplicationContext, spawn_id: str):
+@option("provider", description="The Provider to use")
+@option("model", description="The model to use")
+@option("working_dir", description="The working directory for the agent to work in")
+async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, working_dir: str = DEFAULT_WORKING_DIR):
     """Registers a unique spawn ID that can be used for future prompts."""
     if spawn_id in spawns:
         await ctx.respond(
             f"❌ Spawn ID '{spawn_id}' is already in use.", ephemeral=True
+        )
+        return
+    if provider not in ALLOWED_PROVIDERS:
+        await ctx.respond(
+            f"❌ Provider '{provider}' is not allowed.", ephemeral=True
+        )
+        return
+    if not os.path.exists(working_dir) or not os.path.isdir(working_dir):
+        await ctx.respond(
+            f"❌ Working Dir '{working_dir}' does not exist.", ephemeral=True
         )
         return
     session_id = get_random_id()
@@ -130,6 +167,8 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str):
     spawns[spawn_id] = {
         "spawn_id": spawn_id,
         "session_id": session_id,
+        "provider": provider,
+        "model": model,
         "channel": ctx.channel,
         "user": ctx.author,
         "processes": []
@@ -140,10 +179,37 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str):
     )
 
 
+@bot.slash_command(name="set_provider", description="Change the provider for an already existing Agent")
+@option("spawn_id", description="The ID of the Agent")
+@option("provider", description="The Provider to use")
+async def set_provider(spawn_id: str, provider: str = DEFAULT_PROVIDER):
+    if spawn_id not in spawns:
+        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
+        return
+    if provider not in ALLOWED_PROVIDERS:
+        await ctx.respond(f"❌ Invalid provider '{provider}'.", ephemeral=True)
+        return
+    entry = spawns[spawn_id]
+    entry["provider"] = provider
+    save_spawns()
+
+
+@bot.slash_command(name="set_model", description="Change the model for an already existing Agent")
+@option("spawn_id", description="The ID of the Agent")
+@option("model", description="The model to use")
+async def set_model(spawn_id: str, model: str = DEFAULT_MODEL):
+    if spawn_id not in spawns:
+        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
+        return
+    entry = spawns[spawn_id]
+    entry["model"] = model
+    save_spawns()
+
+
 @bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
 @option("spawn_id", description="The spawn ID to kill processes for")
 @option("delete", description="Delete it fully?", type=bool)
-async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool):
+async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False):
     """Kills all active processes associated with the given spawn ID."""
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
@@ -204,8 +270,8 @@ def format_response(msg: str) -> str:
 
 
 def format_thought(msg: str) -> str:
-    # TODO add thinking bubbles or something
-    return msg
+    indicator = "💭💭💭💭💭"
+    return f"{indicator}\n{msg}\n{indicator}"
 
 
 def format_command(msg: str) -> str:
@@ -227,14 +293,14 @@ def rfind_nth(haystack: str, needle: str, nth: int) -> int:
     return idx
 
 
-def send_codex_notification(worker_entry: dict, notification: bytes, reference=None):
-    msg = notification.decode('utf-8')
+def send_codex_notification(worker_entry: dict, msg: str, reference=None):
     action = ''
     messages = [msg]
     try:
         content = json.loads(msg)
-        if content.get("role", "assistant") != "assistant":
-            raise RuntimeError("Unexpected message from role '" + content['role'] + "'")
+        if content.get("role", "unknown") == "user":
+            # raise RuntimeError("Unexpected message from role '" + content['role'] + "'")
+            return
         if "type" not in content:
             raise RuntimeError("Missing attribute 'type'")
         content_ty = content["type"]
@@ -251,6 +317,7 @@ def send_codex_notification(worker_entry: dict, notification: bytes, reference=N
             messages = [format_command(' '.join(content['action']['command']))]
             action = ' executed'
         elif content_ty == "local_shell_call_output":
+            assert 'output' in content
             try:
                 out = content["output"].encode('utf-8').decode('unicode_escape')
                 # You can't properly load `out`. It should be json, but it is not escaped, so we have to
@@ -275,6 +342,10 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
     ping = f"<@{user_id}> " if critical else ""
     coro = channel.send(f"{ping}**{spawn_id}**{action}:\n{notification}", reference=reference)
     asyncio.run_coroutine_threadsafe(coro, bot.loop)
+
+
+def get_history_item_content(item: dict):
+    return item.get('content') or item.get('summary') or item.get('output') or item['action']['command']
 
 
 @bot.event
@@ -304,6 +375,9 @@ async def on_message(message: discord.Message):
     entry['channel'] = message.channel
 
     session_id = entry['session_id']
+    provider = entry.get('provider', DEFAULT_PROVIDER)
+    if provider not in ALLOWED_PROVIDERS:
+        provider = DEFAULT_PROVIDER
     args = [
         "node",
         "third_party/codex-headless/dist/cli.mjs",
@@ -311,15 +385,19 @@ async def on_message(message: discord.Message):
         prompt,
         "--session-id",
         session_id,
+        "--full-auto",
+        "--provider",
+        provider,
+        "-m",
+        entry.get("model", DEFAULT_MODEL),
     ]
+
     sess_fp = get_session_file_path(session_id)
     if not os.path.exists(sess_fp):
         init_session_file(session_id)
     with open(sess_fp) as f:
         sess = json.load(f)
-
-    # the first n_msg_in_chat + 1 (the user's new message that triggered this function) must be ignored
-    num_lines_to_ignore = len(sess['items']) + 1
+    prev_sess_items = sess['items'].copy()
 
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -332,32 +410,54 @@ async def on_message(message: discord.Message):
     async def reader():
         if DEBUG:
             print("Spawning process", file=sys.stderr)
-        n_ignored = 0
 
+        notifications: list[dict] = []
         async for line in proc.stdout:
-            if n_ignored < num_lines_to_ignore:
-                if DEBUG:
-                    print("[IGNORED] New line from process:", line, file=sys.stderr)
-                n_ignored += 1
+            line = line.strip().decode('utf-8')
+            try:
+                line_json = json.loads(line)
+            except json.JSONDecodeError:
+                print(traceback.format_exc(), file=sys.stderr)
+                continue
+            notifications.append(line_json)
+
+            # Ignore messages that were part of the session file (that will be re-printed) by
+            # matchig their content against what is printed (not all will be printed for some reason).
+            # This assumes that all messages that will be printed (up until the new user message) are
+            # part of the session file as well.
+            ignore_this = False
+            while prev_sess_items:
+                prev_item = prev_sess_items.pop(0)
+                prev_content = get_history_item_content(prev_item)
+                content = get_history_item_content(line_json)
+                if content == prev_content:
+                    ignore_this = True
+                    if DEBUG:
+                        print("[IGNORED] New line from process:", line, file=sys.stderr)
+                    break
+            if ignore_this:
                 continue
 
-            line = line.strip()
             if DEBUG:
                 print("New line from process:", line, file=sys.stderr)
 
             send_codex_notification(entry, line, reference=message)
 
-        send_notification(entry, f"WORKER '{spawn_id}' FINISHED!", critical=True, reference=message)
+        # Send termination notification
+        send_notification(entry, f"AGENT '{spawn_id}' FINISHED!", critical=True, reference=message)
         if DEBUG:
             print("Retiring process", file=sys.stderr)
         await proc.wait()
+
+        # Overwrite the auto-updated sessions file manually to remove messages the cli ignores.
+        # Example: empty reasoning summary messages
+        write_session_file(session_id, notifications)
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 
 
 if __name__ == "__main__":
     token = os.getenv("DISCORD_BOT_TOKEN")
-    api_key = os.getenv("MODEL_API_KEY")
     if not token:
         print("Error: DISCORD_BOT_TOKEN environment variable not set.")
         exit(1)

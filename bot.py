@@ -30,8 +30,8 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest")
 assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
 
 NO_DOCKER = int(os.getenv("NO_DOCKER", 0))
-CODEX_CONTAINER_NAME = os.getenv("CODEX_CONTAINER_NAME")
-assert NO_DOCKER or CODEX_CONTAINER_NAME is not None
+CODEX_DOCKER_IMAGE_NAME = os.getenv("CODEX_DOCKER_IMAGE_NAME")
+assert NO_DOCKER or CODEX_DOCKER_IMAGE_NAME is not None
 
 all_api_keys = {}
 for k, v in os.environ.items():
@@ -140,6 +140,106 @@ def init_session_file(session_id: str):
     write_session_file(session_id, [])
 
 
+async def run_proc_and_wait(*args):
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    await proc.communicate()
+    if proc.returncode != 0:
+        print(f"[ERROR IN PREVIOUS PROCESS: EXIT CODE {proc.returncode}]", file=sys.stderr)
+    return proc.returncode
+
+
+async def commit_agent_docker_image(spawn_id: str):
+    """Writes the changes that were performed within a docker container to the image of name {CODEX_DOCKER_IMAGE_NAME}:{spawn_id}"""
+    docker_args = [
+        "docker",
+        "commit",
+        f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
+        f"{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
+    ]
+    await run_proc_and_wait(*docker_args)
+    docker_args = [
+        "docker",
+        "rm",
+        f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
+    ]
+    await run_proc_and_wait(*docker_args)
+
+
+async def create_agent_docker_image(spawn_id: str):
+    """Create a new docker image called {CODEX_DOCKER_IMAGE_NAME}:{spawn_id} by creating (not running) a temporary container and the committing it"""
+    docker_args = [
+        "docker",
+        "create",
+        "--name", f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
+        CODEX_DOCKER_IMAGE_NAME,
+    ]
+    await run_proc_and_wait(*docker_args)
+    await commit_agent_docker_image(spawn_id)
+
+
+async def del_agent_docker_image(spawn_id: str):
+    """Delete a docker image called {CODEX_DOCKER_IMAGE_NAME}:{spawn_id}"""
+    docker_args = [
+        "docker",
+        "rmi",
+        "{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
+    ]
+    await run_proc_and_wait(*docker_args)
+
+
+async def launch_agent(
+    spawn_id: str,
+    prompt: str,
+    session_id: str,
+    provider: str,
+    model: str,
+    working_dir: str,
+):
+    if NO_DOCKER:
+        optional_docker_prefix = []
+        cli_script_abspath = os.path.join(BOT_WORKING_DIR, "third_party/codex-headless/dist/cli.mjs")
+    else:
+        api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys.items()]
+        env_var_setters = []
+        for ev in api_key_env_var_kvs:
+            env_var_setters.append("-e")
+            env_var_setters.append(ev)
+        optional_docker_prefix = [
+            "docker",
+            "run",
+            "--name", f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
+            "-i",  # leaves stdin open (required by codex cli even in quiet mode for whatever reason)
+            "-v", f"{working_dir}:/root",
+            "-v", f"{SESSIONS_DIR}:/root/.codex/sessions",
+            *env_var_setters,
+            f"{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
+        ]
+        cli_script_abspath = "/CodexMaster/third_party/codex-headless/dist/cli.mjs"
+
+    args = optional_docker_prefix + [
+        "node",
+        cli_script_abspath,
+        "-q", prompt,
+        "--session-id", session_id,
+        "--full-auto",
+        "--provider", provider,
+        "-m", model,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=working_dir,
+    )
+    return proc
+
+
 @bot.slash_command(name="set_instructions", description="Sets the instructions that will be passed to ALL Codex Agents spawned from now on")
 @option("new_instructions", description="The new instructions")
 async def set_instructions(ctx: discord.ApplicationContext, new_instructions: str):
@@ -179,6 +279,8 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
         return
     session_id = get_random_id()
     init_session_file(session_id)
+    if not NO_DOCKER:
+        await create_agent_docker_image(spawn_id)
     spawns[spawn_id] = {
         "spawn_id": spawn_id,
         "session_id": session_id,
@@ -224,11 +326,7 @@ async def set_model(ctx: discord.ApplicationContext, spawn_id: str, model: str =
     await ctx.respond(f"✅ Model for '{spawn_id}' set to '{model}'.", ephemeral=True)
 
 
-@bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
-@option("spawn_id", description="The spawn ID to kill processes for")
-@option("delete", description="Delete it fully?", type=bool)
-@option("revert_chat_state", description="Revert the chat state to before you sent your last message?", type=bool)
-async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False, revert_chat_state: bool = True):
+async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False, revert_chat_state: bool = True):
     """Kills all active processes associated with the given spawn ID."""
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
@@ -238,6 +336,8 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
         append_msg = "."
         if delete:
             append_msg = f" (permanently deleted agent '{spawn_id}')."
+            if not NO_DOCKER:
+                await del_agent_docker_image(spawn_id)
             del spawns[spawn_id]
         save_spawns()
         await ctx.respond(f"ℹ️ No active processes for spawn ID '{spawn_id}'" + append_msg, ephemeral=True)
@@ -247,6 +347,7 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
         try:
             proc = item["proc"]
             proc.kill()
+            await proc.wait()
             if revert_chat_state:
                 # Signals to the reader of the proc that the proc was killed
                 newly_killed_procs.append(proc)
@@ -255,9 +356,32 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
             pass
     spawns[spawn_id]["processes"] = []
     if delete:
+        if not NO_DOCKER:
+            await del_agent_docker_image(spawn_id)
         del spawns[spawn_id]
     save_spawns()
     await ctx.respond(f"✅ Killed {count} process(es) for spawn ID '{spawn_id}'.", ephemeral=True)
+
+
+@bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
+@option("spawn_id", description="The spawn ID to kill processes for")
+@option("delete", description="Delete it fully?", type=bool)
+@option("revert_chat_state", description="Revert the chat state to before you sent your last message?", type=bool)
+async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False, revert_chat_state: bool = True):
+    return await kill_impl(ctx, spawn_id, delete, revert_chat_state)
+
+
+@bot.slash_command(name="delete_all_agents", description="Delete spawns.json")
+@option("confirmation", description="Type CONFIRM to confirm the action")
+async def del_spawns_file(ctx: discord.ApplicationContext, confirmation: str):
+    if confirmation != "CONFIRM":
+        await ctx.respond("❌ You must confirm this action by typing CONFIRM in the confirmation field")
+    spawn_ids = set(spawns)
+    for spawn_id in spawn_ids:
+        await kill_impl(ctx, spawn_id, True)
+    if os.path.exists("spawns.json"):
+        os.remove("spawns.json")
+    await ctx.respond("✅ Killed and deleted all agents and docker containers - EVERYTHING!")
 
 
 @bot.slash_command(name="list", description="List active workers and their processes with PID and runtime")
@@ -373,49 +497,6 @@ def get_history_item_content(item: dict):
     return item.get('content') or item.get('summary') or item.get('output') or item['action']['command']
 
 
-def build_codex_launch_cmd(
-    prompt: str,
-    session_id: str,
-    provider: str,
-    model: str,
-    working_dir: str,
-) -> list[str]:
-    if NO_DOCKER:
-        optional_docker_prefix = []
-        cli_script_abspath = os.path.join(BOT_WORKING_DIR, "third_party/codex-headless/dist/cli.mjs")
-    else:
-        api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys.items()]
-        env_var_setters = []
-        for ev in api_key_env_var_kvs:
-            env_var_setters.append("-e")
-            env_var_setters.append(ev)
-        optional_docker_prefix = [
-            "docker",
-            "run",
-            "-i",  # leaves stdin open (required by codex cli even in quiet mode for whatever reason)
-            "--rm",  # TODO I should make container state be per-agent and not per-prompt
-            "-v", f"{working_dir}:/root",
-            "-v", f"{SESSIONS_DIR}:/root/.codex/sessions",
-            *env_var_setters,
-            CODEX_CONTAINER_NAME,
-        ]
-        cli_script_abspath = "/CodexMaster/third_party/codex-headless/dist/cli.mjs"
-
-    return optional_docker_prefix + [
-        "node",
-        cli_script_abspath,
-        "-q",
-        prompt,
-        "--session-id",
-        session_id,
-        "--full-auto",
-        "--provider",
-        provider,
-        "-m",
-        model,
-    ]
-
-
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -448,7 +529,7 @@ async def on_message(message: discord.Message):
         provider = DEFAULT_PROVIDER
     model = entry.get("model", DEFAULT_MODEL)
     working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
-    args = build_codex_launch_cmd(prompt, session_id, provider, model, working_dir)
+    proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir)
 
     sess_fp = get_session_file_path(session_id)
     if not os.path.exists(sess_fp):
@@ -458,13 +539,6 @@ async def on_message(message: discord.Message):
     prev_sess_items_og = sess['items'].copy()
     prev_sess_items = prev_sess_items_og.copy()
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=working_dir,
-    )
     assert proc.stdout is not None
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
 
@@ -507,7 +581,7 @@ async def on_message(message: discord.Message):
             send_codex_notification(entry, line, reference=message)
 
         # Send termination notification
-        send_notification(entry, f"AGENT '{spawn_id}' FINISHED!", critical=True, reference=message)
+        send_notification(entry, f"AGENT **{spawn_id}** COMPLETED HIS MISSION!", critical=True, reference=message)
         if LOG_LEVEL:
             print("Retiring process", file=sys.stderr)
         await proc.wait()
@@ -520,6 +594,10 @@ async def on_message(message: discord.Message):
             write_session_file(session_id, prev_sess_items_og)
         else:
             write_session_file(session_id, notifications)
+
+        # Save container state to image
+        if not NO_DOCKER:
+            await commit_agent_docker_image(spawn_id)
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 

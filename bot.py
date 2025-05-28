@@ -18,7 +18,7 @@ load_dotenv()
 # Only allow these Discord user IDs to interact with the bot.
 # You can list them in the ALLOWED_USER_IDS env var (comma-separated).
 allowed_ids_env = os.getenv("ALLOWED_USER_IDS", "")
-DEBUG = int(os.getenv("DEBUG", 0))
+LOG_LEVEL = int(os.getenv("LOG_LEVEL", 0))
 ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
 
 BOT_WORKING_DIR = os.getcwd()
@@ -466,7 +466,7 @@ async def on_message(message: discord.Message):
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
 
     async def reader():
-        if DEBUG:
+        if LOG_LEVEL:
             print("Spawning process", file=sys.stderr)
 
         notifications: list[dict] = []
@@ -490,20 +490,20 @@ async def on_message(message: discord.Message):
                 content = get_history_item_content(line_json)
                 if content == prev_content:
                     ignore_this = True
-                    if DEBUG:
+                    if LOG_LEVEL:
                         print("[IGNORED] New line from process:", line, file=sys.stderr)
                     break
             if ignore_this:
                 continue
 
-            if DEBUG:
+            if LOG_LEVEL:
                 print("New line from process:", line, file=sys.stderr)
 
             send_codex_notification(entry, line, reference=message)
 
         # Send termination notification
         send_notification(entry, f"AGENT '{spawn_id}' FINISHED!", critical=True, reference=message)
-        if DEBUG:
+        if LOG_LEVEL:
             print("Retiring process", file=sys.stderr)
         await proc.wait()
 

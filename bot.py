@@ -235,10 +235,12 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
         return
     procs = spawns[spawn_id]["processes"]
     if not procs:
-        await ctx.respond(f"ℹ️ No active processes for spawn ID '{spawn_id}'.", ephemeral=True)
+        append_msg = "."
         if delete:
+            append_msg = f" (permanently deleted agent '{spawn_id}')."
             del spawns[spawn_id]
         save_spawns()
+        await ctx.respond(f"ℹ️ No active processes for spawn ID '{spawn_id}'" + append_msg, ephemeral=True)
         return
     count = 0
     for item in procs:
@@ -378,10 +380,9 @@ def build_codex_launch_cmd(
     model: str,
     working_dir: str,
 ) -> list[str]:
-    cli_script_relpath = "third_party/codex-headless/dist/cli.mjs"
     if NO_DOCKER:
         optional_docker_prefix = []
-        cli_script_abspath = os.path.join(BOT_WORKING_DIR, cli_script_relpath)
+        cli_script_abspath = os.path.join(BOT_WORKING_DIR, "third_party/codex-headless/dist/cli.mjs")
     else:
         api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys.items()]
         env_var_setters = []
@@ -391,13 +392,14 @@ def build_codex_launch_cmd(
         optional_docker_prefix = [
             "docker",
             "run",
-            "--rm",
-            "-v", f"{working_dir}:~",
-            "-v", f"{SESSIONS_DIR}:~/.codex/sessions",
+            "-i",  # leaves stdin open (required by codex cli even in quiet mode for whatever reason)
+            "--rm",  # TODO I should make container state be per-agent and not per-prompt
+            "-v", f"{working_dir}:/root",
+            "-v", f"{SESSIONS_DIR}:/root/.codex/sessions",
             *env_var_setters,
             CODEX_CONTAINER_NAME,
         ]
-        cli_script_abspath = cli_script_relpath  # within docker
+        cli_script_abspath = "/CodexMaster/third_party/codex-headless/dist/cli.mjs"
 
     return optional_docker_prefix + [
         "node",
@@ -458,6 +460,7 @@ async def on_message(message: discord.Message):
 
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=working_dir,
@@ -475,6 +478,8 @@ async def on_message(message: discord.Message):
             try:
                 line_json = json.loads(line)
             except json.JSONDecodeError:
+                if LOG_LEVEL:
+                    print("[ERROR] New line from process:", line, file=sys.stderr)
                 print(traceback.format_exc(), file=sys.stderr)
                 continue
             notifications.append(line_json)

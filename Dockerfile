@@ -1,5 +1,5 @@
 # Use official Node.js LTS base image (with Debian)
-FROM node:20-bookworm
+FROM node:22-bookworm
 
 # Set the working directory to /root (acts like ~)
 WORKDIR /root
@@ -27,4 +27,4 @@ ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
 # Copy the CLI file for codex-headless
-COPY ./third_party/codex-headless/dist/cli.mjs /root/cli.mjs
+COPY ./third_party/codex-headless/dist/cli.mjs /CodexMaster/third_party/codex-headless/dist/cli.mjs

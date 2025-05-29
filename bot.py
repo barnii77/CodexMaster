@@ -12,6 +12,7 @@ from discord import option
 from discord.ext import commands
 from dotenv import load_dotenv
 from typing import Optional
+from copy import deepcopy
 
 load_dotenv()
 
@@ -22,11 +23,11 @@ LOG_LEVEL = int(os.getenv("LOG_LEVEL", 0))
 ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
 
 BOT_WORKING_DIR = os.getcwd()
-ALLOWED_PROVIDERS = os.getenv("ALLOWED_PROVIDERS", "openai").split(',')
+ALLOWED_PROVIDERS = list(map(str.strip, os.getenv("ALLOWED_PROVIDERS", "openai").split(',')))
 DEFAULT_WORKING_DIR = os.path.expanduser(os.getenv("DEFAULT_WORKING_DIR", os.getcwd()))
 assert ':' not in DEFAULT_WORKING_DIR
-DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest")
+DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai").strip()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest").strip()
 assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
 
 NO_DOCKER = int(os.getenv("NO_DOCKER", 0))
@@ -78,7 +79,7 @@ def save_spawns():
     with open("spawns.json", "w") as f:
         spawns_to_save = {}
         for k, spawn in spawns.items():
-            spawn = spawn.copy()
+            spawn = deepcopy(spawn)
             spawn['processes'].clear()
             spawn['channel'] = None
             spawn['user'] = None
@@ -126,7 +127,7 @@ def write_session_file(session_id: str, items: list[dict]):
         filtered_items.append(item)
     items = filtered_items
 
-    content = session_json_template.copy()
+    content = deepcopy(session_json_template)
     content['session']['id'] = session_id
     timestamp = datetime.datetime.now().isoformat('T', 'milliseconds') + 'Z'
     content['session']['timestamp'] = timestamp
@@ -187,7 +188,7 @@ async def del_agent_docker_image(spawn_id: str):
     docker_args = [
         "docker",
         "rmi",
-        "{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
+        f"{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
     ]
     await run_proc_and_wait(*docker_args)
 
@@ -261,6 +262,7 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
             f"❌ Spawn ID '{spawn_id}' is already in use.", ephemeral=True
         )
         return
+    provider = provider.strip()
     if provider not in ALLOWED_PROVIDERS:
         await ctx.respond(
             f"❌ Provider '{provider}' is not allowed.", ephemeral=True
@@ -285,7 +287,7 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
         "spawn_id": spawn_id,
         "session_id": session_id,
         "provider": provider,
-        "model": model,
+        "model": model.strip(),
         "working_dir": working_dir,
         "channel": ctx.channel,
         "user": ctx.author,
@@ -304,6 +306,7 @@ async def set_provider(ctx: discord.ApplicationContext, spawn_id: str, provider:
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
         return
+    provider = provider.strip()
     if provider not in ALLOWED_PROVIDERS:
         await ctx.respond(f"❌ Invalid provider '{provider}'.", ephemeral=True)
         return
@@ -376,6 +379,7 @@ async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = Fa
 async def del_spawns_file(ctx: discord.ApplicationContext, confirmation: str):
     if confirmation != "CONFIRM":
         await ctx.respond("❌ You must confirm this action by typing CONFIRM in the confirmation field")
+        return
     spawn_ids = set(spawns)
     for spawn_id in spawn_ids:
         await kill_impl(ctx, spawn_id, True)
@@ -467,8 +471,9 @@ def send_codex_notification(worker_entry: dict, msg: str, reference=None):
             action = ' executed'
         elif content_ty == "local_shell_call_output":
             assert 'output' in content
+            out = content['output']
             try:
-                out = content["output"].encode('utf-8').decode('unicode_escape')
+                out = out.encode('utf-8').decode('unicode_escape')
                 # You can't properly load `out`. It should be json, but it is not escaped, so we have to
                 # hackily extract the content of the 'output' field.
                 start = out.find(':') + 2
@@ -524,10 +529,10 @@ async def on_message(message: discord.Message):
     entry['channel'] = message.channel
 
     session_id = entry['session_id']
-    provider = entry.get('provider', DEFAULT_PROVIDER)
+    provider = entry.get('provider', DEFAULT_PROVIDER).strip()
     if provider not in ALLOWED_PROVIDERS:
         provider = DEFAULT_PROVIDER
-    model = entry.get("model", DEFAULT_MODEL)
+    model = entry.get("model", DEFAULT_MODEL).strip()
     working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
     proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir)
 
@@ -536,8 +541,8 @@ async def on_message(message: discord.Message):
         init_session_file(session_id)
     with open(sess_fp) as f:
         sess = json.load(f)
-    prev_sess_items_og = sess['items'].copy()
-    prev_sess_items = prev_sess_items_og.copy()
+    prev_sess_items_og = deepcopy(sess['items'])
+    prev_sess_items = deepcopy(prev_sess_items_og)
 
     assert proc.stdout is not None
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})

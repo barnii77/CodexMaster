@@ -10,7 +10,7 @@ import uuid
 import discord
 from discord import option
 from discord.ext import commands
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 from typing import Optional
 from copy import deepcopy
 
@@ -36,10 +36,10 @@ NO_DOCKER = int(os.getenv("NO_DOCKER", 0))
 CODEX_DOCKER_IMAGE_NAME = os.getenv("CODEX_DOCKER_IMAGE_NAME")
 assert NO_DOCKER or CODEX_DOCKER_IMAGE_NAME is not None
 
-all_api_keys = {}
-for k, v in os.environ.items():
-    if k.endswith('_API_KEY'):
-        all_api_keys[k] = v
+CODEX_ENV_FILE = os.getenv("CODEX_ENV_FILE")
+assert CODEX_ENV_FILE is None or os.path.exists(CODEX_ENV_FILE)
+
+ALLOW_LEAK_ENV = bool(os.getenv("ALLOW_LEAK_ENV", False))
 
 with open("session_json_template.json") as f:
     session_json_template = json.load(f)
@@ -48,20 +48,13 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="", intents=intents)
 
 
-# Global pre-check: only allow listed users to run slash commands
-@bot.check
-async def globally_allow_only_listed_users(ctx: commands.Context) -> bool:
-    if ctx.author.id not in ALLOWED_USER_IDS:
-        await ctx.respond("⛔ You are not authorized to use this bot.", ephemeral=True)
-        return False
-    return True
-
-
 # Mapping of spawn IDs to channel, user, and active processes
 spawns: dict[str, dict] = {}
 try:
     with open("spawns.json") as f:
         spawns = json.load(f)
+except json.JSONDecodeError:
+    spawns = {}
 except FileNotFoundError:
     pass
 
@@ -78,14 +71,22 @@ if not os.path.exists(SESSIONS_DIR):
 
 
 def save_spawns():
+    spawns_to_save = {}
+    for k, spawn in spawns.items():
+        # temporarily remove the stuff that cannot be saved (and also not deepcopy'd)
+        procs, chan, user = spawn['processes'], spawn['channel'], spawn['user']
+        spawn['processes'] = []
+        spawn['channel'] = None
+        spawn['user'] = None
+
+        spawns_to_save[k] = deepcopy(spawn)
+
+        # restore spawn attributes
+        spawn['processes'] = procs
+        spawn['channel'] = chan
+        spawn['user'] = user
+
     with open("spawns.json", "w") as f:
-        spawns_to_save = {}
-        for k, spawn in spawns.items():
-            spawn = deepcopy(spawn)
-            spawn['processes'].clear()
-            spawn['channel'] = None
-            spawn['user'] = None
-            spawns_to_save[k] = spawn
         json.dump(spawns_to_save, f)
 
 
@@ -94,6 +95,21 @@ async def on_ready():
     """Called when the bot is ready and connected to Discord."""
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("------")
+
+
+# Global pre-check: only allow listed users to run slash commands
+@bot.check
+async def globally_allow_only_listed_users(ctx: commands.Context) -> bool:
+    if ctx.author.id not in ALLOWED_USER_IDS:
+        await ctx.respond("⛔ You are not authorized to use this bot.")
+        return False
+    return True
+
+
+@bot.before_invoke
+async def auto_defer(interaction: discord.Interaction):
+    # this allows longer response delays and displays "thinking..."
+    await interaction.response.defer()
 
 
 @bot.slash_command(name="hello", description="Responds with 'Hello, world!'")
@@ -152,45 +168,62 @@ async def run_proc_and_wait(*args):
     )
     await proc.communicate()
     if proc.returncode != 0:
-        print(f"[ERROR IN PREVIOUS PROCESS: EXIT CODE {proc.returncode}]", file=sys.stderr)
+        try:
+            raise RuntimeError(f"[ERROR IN SPAWNED PROCESS: EXIT CODE {proc.returncode}]: command {' '.join(args)} failed")
+        except RuntimeError:
+            print(traceback.format_exc(), file=sys.stderr)
     return proc.returncode
 
 
-async def commit_agent_docker_image(spawn_id: str):
-    """Writes the changes that were performed within a docker container to the image of name {CODEX_DOCKER_IMAGE_NAME}:{spawn_id}"""
-    docker_args = [
-        "docker",
-        "commit",
-        f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
-        f"{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
-    ]
-    await run_proc_and_wait(*docker_args)
-    docker_args = [
-        "docker",
-        "rm",
-        f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
-    ]
-    await run_proc_and_wait(*docker_args)
+def get_docker_container_name(spawn_id: str):
+    return f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}"
 
 
-async def create_agent_docker_image(spawn_id: str):
-    """Create a new docker image called {CODEX_DOCKER_IMAGE_NAME}:{spawn_id} by creating (not running) a temporary container and the committing it"""
+async def create_agent_docker_container(spawn_id: str, working_dir: str, leak_env: bool = False):
+    env_var_kvs = [f"{k}={v}" for k, v in os.environ.items()] if leak_env else []
+    env_var_setters = []
+    for ev in env_var_kvs:
+        env_var_setters.append("-e")
+        env_var_setters.append(ev)
+    if CODEX_ENV_FILE is not None:
+        env_var_setters.append("--env-file")
+        env_var_setters.append(CODEX_ENV_FILE)
     docker_args = [
         "docker",
         "create",
-        "--name", f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
+        "--name", get_docker_container_name(spawn_id),
+        "-v", f"{working_dir}:/root/project",  # mount codex working dir
+        "-v", f"{SESSIONS_DIR}:/root/.codex/sessions",  # mount codex sessions dir (required by codex-cli)
+        *env_var_setters,  # inline env var setters with -e and --env-file
         CODEX_DOCKER_IMAGE_NAME,
     ]
     await run_proc_and_wait(*docker_args)
-    await commit_agent_docker_image(spawn_id)
 
 
-async def del_agent_docker_image(spawn_id: str):
-    """Delete a docker image called {CODEX_DOCKER_IMAGE_NAME}:{spawn_id}"""
+async def start_agent_docker_container(spawn_id: str):
     docker_args = [
         "docker",
-        "rmi",
-        f"{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
+        "start",
+        get_docker_container_name(spawn_id),
+    ]
+    await run_proc_and_wait(*docker_args)
+
+
+async def stop_agent_docker_container(spawn_id: str):
+    docker_args = [
+        "docker",
+        "stop",
+        "-t", "5",
+        get_docker_container_name(spawn_id),
+    ]
+    await run_proc_and_wait(*docker_args)
+
+
+async def delete_agent_docker_container(spawn_id: str):
+    docker_args = [
+        "docker",
+        "rm",
+        get_docker_container_name(spawn_id),
     ]
     await run_proc_and_wait(*docker_args)
 
@@ -202,33 +235,40 @@ async def launch_agent(
     provider: str,
     model: str,
     working_dir: str,
+    leak_env: bool = False,
 ):
+    assert not leak_env or ALLOW_LEAK_ENV
+
     if NO_DOCKER:
         optional_docker_prefix = []
         cli_script_abspath = os.path.join(BOT_WORKING_DIR, "third_party/codex-headless/dist/cli.mjs")
+        if leak_env:
+            proc_env = None
+        elif CODEX_ENV_FILE is not None:
+            proc_env = dotenv_values(CODEX_ENV_FILE)
+        else:
+            proc_env = {"__ENV_LEAK_DISABLED": 1}
     else:
-        api_key_env_var_kvs = [f"{k}={v}" for k, v in all_api_keys.items()]
-        env_var_setters = []
-        for ev in api_key_env_var_kvs:
-            env_var_setters.append("-e")
-            env_var_setters.append(ev)
+        proc_env = None  # docker itself gets all host env vars
+
+        # Start docker container first (non-blocking)
+        await start_agent_docker_container(spawn_id)
+
         optional_docker_prefix = [
             "docker",
-            "run",
-            "--name", f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",
+            "exec",
             "-i",  # leaves stdin open (required by codex cli even in quiet mode for whatever reason)
-            "-v", f"{working_dir}:/root",
-            "-v", f"{SESSIONS_DIR}:/root/.codex/sessions",
-            *env_var_setters,
-            f"{CODEX_DOCKER_IMAGE_NAME}:{spawn_id}",
+            f"{CODEX_DOCKER_IMAGE_NAME}-agent-container-{spawn_id}",  # agent container
         ]
         cli_script_abspath = "/CodexMaster/third_party/codex-headless/dist/cli.mjs"
+        working_dir = None  # launch docker itself in current working dir
 
     args = optional_docker_prefix + [
         "node",
         cli_script_abspath,
         "-q", prompt,
         "--session-id", session_id,
+        "--update-session-file", "false",
         "--full-auto",
         "--provider", provider,
         "-m", model,
@@ -239,6 +279,7 @@ async def launch_agent(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=working_dir,
+        env=proc_env,
     )
     return proc
 
@@ -257,48 +298,55 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 @option("provider", description="The Provider to use")
 @option("model", description="The model to use")
 @option("working_dir", description="The working directory for the agent to work in")
-async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, working_dir: str = DEFAULT_WORKING_DIR):
+@option("leak_env", description="If set, leaks the env vars from the host system into the Codex container")
+async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, working_dir: str = DEFAULT_WORKING_DIR, leak_env: bool = False):
     """Registers a unique spawn ID that can be used for future prompts."""
     if spawn_id in spawns:
         await ctx.respond(
-            f"❌ Spawn ID '{spawn_id}' is already in use.", ephemeral=True
+            f"❌ Spawn ID '{spawn_id}' is already in use."
         )
         return
     provider = provider.strip()
     if provider not in ALLOWED_PROVIDERS:
         await ctx.respond(
-            f"❌ Provider '{provider}' is not allowed.", ephemeral=True
+            f"❌ Provider '{provider}' is not allowed."
         )
         return
     working_dir = os.path.expanduser(working_dir)
     if ':' in working_dir:
         await ctx.respond(
-                f"❌ Working Dir '{working_dir}' must not contain ':'", ephemeral=True
+                f"❌ Working Dir '{working_dir}' must not contain ':'"
         )
         return
     if not os.path.exists(working_dir) or not os.path.isdir(working_dir):
         await ctx.respond(
-            f"❌ Working Dir '{working_dir}' does not exist.", ephemeral=True
+            f"❌ Working Dir '{working_dir}' does not exist."
+        )
+        return
+    if not ALLOW_LEAK_ENV and leak_env:
+        await ctx.respond(
+            f"❌ leak_env=True has been configured as disallowed."
         )
         return
     session_id = get_random_id()
     init_session_file(session_id)
+    await ctx.respond(
+        f"✅ Spawn ID '{spawn_id}' registered. Mention me with 'to {spawn_id}: <message>' to send prompts."
+    )
     if not NO_DOCKER:
-        await create_agent_docker_image(spawn_id)
+        await create_agent_docker_container(spawn_id, working_dir, leak_env)
     spawns[spawn_id] = {
         "spawn_id": spawn_id,
         "session_id": session_id,
         "provider": provider,
         "model": model.strip(),
         "working_dir": working_dir,
+        "leak_env": leak_env,
         "channel": ctx.channel,
         "user": ctx.author,
         "processes": []
     }
     save_spawns()
-    await ctx.respond(
-        f"✅ Spawn ID '{spawn_id}' registered. Mention me with 'to {spawn_id}: <message>' to send prompts."
-    )
 
 
 @bot.slash_command(name="set_provider", description="Change the provider for an already existing Agent")
@@ -306,16 +354,16 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
 @option("provider", description="The Provider to use")
 async def set_provider(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER):
     if spawn_id not in spawns:
-        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
+        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.")
         return
     provider = provider.strip()
     if provider not in ALLOWED_PROVIDERS:
-        await ctx.respond(f"❌ Invalid provider '{provider}'.", ephemeral=True)
+        await ctx.respond(f"❌ Invalid provider '{provider}'.")
         return
     entry = spawns[spawn_id]
     entry["provider"] = provider
     save_spawns()
-    await ctx.respond(f"✅ Provider for '{spawn_id}' set to '{provider}'.", ephemeral=True)
+    await ctx.respond(f"✅ Provider for '{spawn_id}' set to '{provider}'.")
 
 
 @bot.slash_command(name="set_model", description="Change the model for an already existing Agent")
@@ -323,18 +371,18 @@ async def set_provider(ctx: discord.ApplicationContext, spawn_id: str, provider:
 @option("model", description="The model to use")
 async def set_model(ctx: discord.ApplicationContext, spawn_id: str, model: str = DEFAULT_MODEL):
     if spawn_id not in spawns:
-        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
+        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.")
         return
     entry = spawns[spawn_id]
     entry["model"] = model
     save_spawns()
-    await ctx.respond(f"✅ Model for '{spawn_id}' set to '{model}'.", ephemeral=True)
+    await ctx.respond(f"✅ Model for '{spawn_id}' set to '{model}'.")
 
 
 async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False, revert_chat_state: bool = True):
     """Kills all active processes associated with the given spawn ID."""
     if spawn_id not in spawns:
-        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.", ephemeral=True)
+        await ctx.respond(f"❌ Unknown spawn ID '{spawn_id}'.")
         return
     procs = spawns[spawn_id]["processes"]
     if not procs:
@@ -342,30 +390,40 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
         if delete:
             append_msg = f" (permanently deleted agent '{spawn_id}')."
             if not NO_DOCKER:
-                await del_agent_docker_image(spawn_id)
+                await delete_agent_docker_container(spawn_id)
             del spawns[spawn_id]
         save_spawns()
-        await ctx.respond(f"ℹ️ No active processes for spawn ID '{spawn_id}'" + append_msg, ephemeral=True)
+        await ctx.respond(f"ℹ️ No active processes for spawn ID '{spawn_id}'" + append_msg)
         return
+
+    if not NO_DOCKER:
+        await stop_agent_docker_container(spawn_id)
+
     count = 0
     for item in procs:
+        proc = item["proc"]
         try:
-            proc = item["proc"]
             proc.kill()
-            await proc.wait()
-            if revert_chat_state:
-                # Signals to the reader of the proc that the proc was killed
-                newly_killed_procs.append(proc)
-            count += 1
         except Exception:
             pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+
+        await ctx.respond(f"✅ Killed a process for agent '{spawn_id}'.")
+        if revert_chat_state:
+            # Signals to the reader of the proc that the proc was killed
+            newly_killed_procs.append(proc)
+        count += 1
+
     spawns[spawn_id]["processes"] = []
     if delete:
         if not NO_DOCKER:
-            await del_agent_docker_image(spawn_id)
+            await delete_agent_docker_container(spawn_id)
         del spawns[spawn_id]
     save_spawns()
-    await ctx.respond(f"✅ Killed {count} process(es) for spawn ID '{spawn_id}'.", ephemeral=True)
+    await ctx.respond(f"✅ Killed {count} process(es) for spawn ID '{spawn_id}'.")
 
 
 @bot.slash_command(name="kill", description="Kill active processes for a spawn ID")
@@ -394,7 +452,7 @@ async def del_spawns_file(ctx: discord.ApplicationContext, confirmation: str):
 async def list_spawns(ctx: discord.ApplicationContext):
     """Lists all spawn IDs and their active processes, showing PID and runtime."""
     if not spawns:
-        await ctx.respond("ℹ️ No spawn workers registered.", ephemeral=True)
+        await ctx.respond("ℹ️ No spawn workers registered.")
         return
     now = datetime.datetime.now()
     lines: list[str] = []
@@ -417,7 +475,7 @@ async def list_spawns(ctx: discord.ApplicationContext):
                 lines.append(f" • PID {p.pid} – running for {elapsed}")
         else:
             lines.append(f"**{sid}**: no active processes")
-    await ctx.respond("\n".join(lines), ephemeral=True)
+    await ctx.respond("\n".join(lines))
 
 
 def format_response(msg: str) -> str:
@@ -494,7 +552,30 @@ def send_codex_notification(worker_entry: dict, msg: str, reference=None):
 
 
 def close_unterminated_code_blocks(s: str) -> str:
-    pass
+    """
+    Ensures any unclosed inline `…` or block ```…``` code fences get closed
+    in the correct order (inline first, then block).
+    """
+    fence3 = "```"
+    # Count triple fences
+    n3 = s.count(fence3)
+
+    # Temporarily strip them to count only inline backticks
+    tmp = s.replace(fence3, "")
+    n1 = tmp.count("`")
+
+    # Close inline code first, if needed
+    if n1 % 2 == 1:
+        s += "`"
+
+    # Then close triple‐fence blocks
+    if n3 % 2 == 1:
+        # ensure it's on its own line
+        if not s.endswith("\n"):
+            s += "\n"
+        s += fence3
+
+    return s
 
 
 def send_notification(worker_entry: dict, notification: str, critical: bool = False, reference=None, action=''):
@@ -548,7 +629,10 @@ async def on_message(message: discord.Message):
         provider = DEFAULT_PROVIDER
     model = entry.get("model", DEFAULT_MODEL).strip()
     working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
-    proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir)
+    leak_env = entry.get("leak_env", False)
+    proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir, leak_env)
+    
+    await message.channel.send("✅ Agent deployed...", reference=message)
 
     sess_fp = get_session_file_path(session_id)
     if not os.path.exists(sess_fp):
@@ -614,9 +698,9 @@ async def on_message(message: discord.Message):
         else:
             write_session_file(session_id, notifications)
 
-        # Save container state to image
+        # Stop container
         if not NO_DOCKER:
-            await commit_agent_docker_image(spawn_id)
+            await stop_agent_docker_container(spawn_id)
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 

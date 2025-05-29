@@ -22,6 +22,8 @@ allowed_ids_env = os.getenv("ALLOWED_USER_IDS", "")
 LOG_LEVEL = int(os.getenv("LOG_LEVEL", 0))
 ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
 
+DISCORD_CHARACTER_LIMIT = 1950
+
 BOT_WORKING_DIR = os.getcwd()
 ALLOWED_PROVIDERS = list(map(str.strip, os.getenv("ALLOWED_PROVIDERS", "openai").split(',')))
 DEFAULT_WORKING_DIR = os.path.expanduser(os.getenv("DEFAULT_WORKING_DIR", os.getcwd()))
@@ -491,10 +493,22 @@ def send_codex_notification(worker_entry: dict, msg: str, reference=None):
         send_notification(worker_entry, m, reference=reference, action=action)
 
 
+def close_unterminated_code_blocks(s: str) -> str:
+    pass
+
+
 def send_notification(worker_entry: dict, notification: str, critical: bool = False, reference=None, action=''):
     channel, user_id, spawn_id = worker_entry["channel"], worker_entry["user"].id, worker_entry["spawn_id"]
     ping = f"<@{user_id}> " if critical else ""
-    coro = channel.send(f"{ping}**{spawn_id}**{action}:\n{notification}", reference=reference)
+
+    msg = f"{ping}**{spawn_id}**{action}:\n{notification}"
+    msg = close_unterminated_code_blocks(msg[:DISCORD_CHARACTER_LIMIT]) + (
+        f"\n\n... ({len(msg[DISCORD_CHARACTER_LIMIT:].splitlines())} lines left)"
+        if len(msg) >= DISCORD_CHARACTER_LIMIT
+        else ""
+    )
+
+    coro = channel.send(msg, reference=reference)
     asyncio.run_coroutine_threadsafe(coro, bot.loop)
 
 

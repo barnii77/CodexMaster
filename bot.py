@@ -68,18 +68,31 @@ instructions = "You are Codex, a highly autonomous AI coding agent that lives in
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 if not os.path.exists(SESSIONS_DIR):
     os.makedirs(SESSIONS_DIR)
+CLEAN_SESSIONS_DIR = os.getenv("CLEAN_SESSIONS_DIR", 0)
+
+
+def clean_sessions_dir():
+    if not CLEAN_SESSIONS_DIR:
+        return
+    live_session_ids = set()
+    for spawn in spawns.values():
+        live_session_ids.add(spawn['session_id'])
+    for filename in os.listdir(SESSIONS_DIR):
+        fp = os.path.join(SESSIONS_DIR, filename)
+        if fp not in live_session_ids:
+            os.remove(fp)
 
 
 def save_spawns():
     spawns_to_save = {}
-    for k, spawn in spawns.items():
+    for spawn_id, spawn in spawns.items():
         # temporarily remove the stuff that cannot be saved (and also not deepcopy'd)
         procs, chan, user = spawn['processes'], spawn['channel'], spawn['user']
         spawn['processes'] = []
         spawn['channel'] = None
         spawn['user'] = None
 
-        spawns_to_save[k] = deepcopy(spawn)
+        spawns_to_save[spawn_id] = deepcopy(spawn)
 
         # restore spawn attributes
         spawn['processes'] = procs
@@ -88,6 +101,8 @@ def save_spawns():
 
     with open("spawns.json", "w") as f:
         json.dump(spawns_to_save, f)
+
+    clean_sessions_dir()
 
 
 @bot.event
@@ -192,8 +207,8 @@ async def create_agent_docker_container(spawn_id: str, working_dir: str, leak_en
         "docker",
         "create",
         "--name", get_docker_container_name(spawn_id),
-        "-v", f"{working_dir}:/root/project",  # mount codex working dir
-        "-v", f"{SESSIONS_DIR}:/root/.codex/sessions",  # mount codex sessions dir (required by codex-cli)
+        "-v", f"{working_dir}:/home/codex/project",  # mount codex working dir
+        "-v", f"{SESSIONS_DIR}:/home/codex/.codex/sessions",  # mount codex sessions dir (required by codex-cli)
         *env_var_setters,  # inline env var setters with -e and --env-file
         CODEX_DOCKER_IMAGE_NAME,
     ]
@@ -268,7 +283,7 @@ async def launch_agent(
         cli_script_abspath,
         "-q", prompt,
         "--session-id", session_id,
-        "--update-session-file", "false",
+        # "--update-session-file", "false",
         "--full-auto",
         "--provider", provider,
         "-m", model,
@@ -632,7 +647,7 @@ async def on_message(message: discord.Message):
     leak_env = entry.get("leak_env", False)
     proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir, leak_env)
     
-    await message.channel.send("✅ Agent deployed...", reference=message)
+    await message.channel.send(f"✅ AGENT **{spawn_id}** DEPLOYED...", reference=message)
 
     sess_fp = get_session_file_path(session_id)
     if not os.path.exists(sess_fp):
@@ -687,20 +702,33 @@ async def on_message(message: discord.Message):
         send_notification(entry, f"AGENT **{spawn_id}** COMPLETED HIS MISSION!", critical=True, reference=message)
         if LOG_LEVEL:
             print("Retiring process", file=sys.stderr)
-        await proc.wait()
-
-        # Overwrite the auto-updated sessions file manually to remove messages the cli ignores.
-        # Example: empty reasoning summary messages.
-        # However, revert content if we were killed
-        if proc in newly_killed_procs:
-            newly_killed_procs.remove(proc)
-            write_session_file(session_id, prev_sess_items_og)
-        else:
-            write_session_file(session_id, notifications)
 
         # Stop container
         if not NO_DOCKER:
             await stop_agent_docker_container(spawn_id)
+
+        await proc.wait()
+
+        # Overwrite the auto-updated sessions file manually to remove messages the cli ignores.
+        # Example: empty reasoning summary messages.
+        # However, revert content if we were killed.
+        if proc in newly_killed_procs:
+            if LOG_LEVEL:
+                print(f"Reverting session file for ID {session_id}", file=sys.stderr)
+            newly_killed_procs.remove(proc)
+            write_session_file(session_id, prev_sess_items_og)
+        else:
+            if LOG_LEVEL:
+                print(f"Updating session file for ID {session_id}", file=sys.stderr)
+            write_session_file(session_id, notifications)
+        
+        # Remove this process from entry["processes"]
+        entry_procs = entry["processes"]
+        for i in range(len(entry_procs)):
+            p = entry_procs[i]
+            if p['proc'] == proc:
+                entry_procs.pop(i)
+                break
 
     asyncio.run_coroutine_threadsafe(reader(), bot.loop)
 

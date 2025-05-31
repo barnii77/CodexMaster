@@ -1,5 +1,5 @@
 # Use official Node.js LTS base image
-FROM node:22-bookworm
+FROM node:22-slim
 
 # Install all requirements, some developer tools, and nuke apt
 RUN apt-get update && apt-get install -y --no-install-recommends \

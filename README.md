@@ -8,6 +8,8 @@ Simply put, it's a discord frontend for Codex CLI (or rather, [my fork](https://
 
 # How to use
 
+Roughly, you have to
+
 1. Create a discord bot. This is supposed to be self hosted and access restricted (you have to whitelist users in `.env`). As you may be able from the code, this system is not built to be scaled.
 2. Populate `.env` file with bot token, whitelist, any API keys (openai, anthropic, ...), and more. See [.example.env](.example.env).
 3. Run directly with `python bot.py`, create a systemd service or a docker container, whatever. Recommended option for deployment on linux is a systemd service that runs as a non-root user.
@@ -19,6 +21,10 @@ By default, the bot will spawn Codex CLI in a docker container. You can disable 
 - python (required) >= 3.9
 - node.js (required) >= 22
 - docker (recommended): If you want to run Codex in a docker container to minimize potential damage. I recommend rootless docker.
+
+## More details
+
+See [SETUP.md](SETUP.md)
 
 # License
 [MIT License](LICENSE)

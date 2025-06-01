@@ -41,8 +41,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # ---------------- Compression ------------------- \
     unzip \
     zip \
-    # ----------------- Nuke APT --------------------- \
-    && rm -rf /var/lib/apt/lists/*
+    iputils-ping
+
+# ------------- Optionally Nuke APT -------------- \
+# rm -rf /var/lib/apt/lists/*
 
 # Set UTF-8 as default locale (good for logs, etc.)
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \

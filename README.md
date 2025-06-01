@@ -21,10 +21,14 @@ By default, the bot will spawn Codex CLI in a docker container. You can disable 
 - python (required) >= 3.9
 - node.js (required) >= 22
 - docker (recommended) >= 21: If you want to run Codex in a docker container to minimize potential damage. I recommend rootless docker.
+- linux (recommended): CodexMaster was developed on linux and is only tested there. It is meant to be hosted as a discord bot, after all.
 
 ## More details
 
-See [SETUP.md](SETUP.md)
+Setup: See [SETUP.md](docs/SETUP.md)
+
+Commands: See [COMMANDS.md](docs/COMMANDS.md).  
+Fun fact, those were written by CodexMaster. You can take a look at the logs from that session [here](docs/codex_master_writes_its_own_docs.log).
 
 # License
 [MIT License](LICENSE)

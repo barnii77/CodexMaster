@@ -1,6 +1,5 @@
 .env
 codex.env
 .venv
-codex_json_out.example.jsonl
 spawns.json
 TODO.md

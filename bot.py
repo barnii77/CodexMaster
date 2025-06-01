@@ -20,7 +20,8 @@ from copy import deepcopy
 
 load_dotenv()
 
-VALID_SPAWN_ID_CHARS = string.ascii_letters + string.digits
+VALID_SPAWN_ID_CHARS = string.ascii_letters + string.digits + "-_"
+VALID_SPAWN_ID_CHARS_REGEX_ENUM = string.ascii_letters + string.digits + "\\-_"
 
 # Only allow these Discord user IDs to interact with the bot.
 # You can list them in the ALLOWED_USER_IDS env var (comma-separated).
@@ -576,7 +577,7 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
                 await delete_agent_docker_container(spawn_id)
             del spawns[spawn_id]
         save_spawns()
-        await ctx.respond(f"ℹ️ No active processes for spawn ID **{spawn_id}**" + append_msg)
+        await ctx.respond(f"ℹ️  No active processes for spawn ID **{spawn_id}**" + append_msg)
         return
 
     if not NO_DOCKER:
@@ -638,7 +639,7 @@ async def del_spawns_file(ctx: discord.ApplicationContext, confirmation: str):
 async def list_spawns(ctx: discord.ApplicationContext):
     """Lists all spawn IDs and their active processes, showing PID and runtime."""
     if not spawns:
-        await ctx.respond("ℹ️ No spawn workers registered.")
+        await ctx.respond("ℹ️  No spawn workers registered.")
         return
     now = datetime.datetime.now()
     lines: list[str] = []
@@ -793,10 +794,18 @@ async def on_message(message: discord.Message):
     if message.author.id not in ALLOWED_USER_IDS:
         return
 
+    # Trim content
+    message.content = message.content.strip()
+
     # Parse bot mention pattern: <@bot_id> to spawn_id: prompt
-    pattern = rf"^<@!?{bot.user.id}>\s+to\s+(\w+):\s*(.+)\s*"
+    pattern = rf"^<@!?{bot.user.id}>\s+to\s+([{VALID_SPAWN_ID_CHARS_REGEX_ENUM}]+?):\s*(.+)\s*"
     match = re.match(pattern, message.content)
     if not match:
+        pattern_without_spawn_id_constraints = rf"^<@!?{bot.user.id}>\s+to\s+(.+?):\s*(.+)\s*"
+        if re.match(pattern_without_spawn_id_constraints, message.content):
+            await message.channel.send(
+                f"ℹ️ In case you meant to DM an agent, your syntax is incorrect. This is the pattern by which messages are matched: `{pattern}`", reference=message
+            )
         return
 
     spawn_id, prompt = match.groups()

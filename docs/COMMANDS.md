@@ -78,6 +78,10 @@ The bot also listens for direct messages in this form to forward prompts to exis
 
 Here, `@Bot` is a mention of the bot (e.g. `<@123456789012345678>`), `<spawn_id>` is the agent's ID, and `<prompt>` is the message to pass.
 
+The reason for this design decision is that it allows the user to write a normal message, potentially with code blocks or file attachments,
+without the restrictions of slash commands and the inconvenience of writing long messages in slash command text fields getting in their way.
+Additionally, it makes it much easier to quickly scan chats, because you can see what you wrote without clicking on the slash command message.
+
 **Example:**
 ```
 <@123456789012345678> to dev: Please refactor the authentication module.

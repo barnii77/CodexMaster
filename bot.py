@@ -8,6 +8,8 @@ import datetime
 import uuid
 import shutil
 import getpass
+import functools
+import string
 
 import discord
 from discord import option
@@ -17,6 +19,8 @@ from typing import Optional, Callable, Awaitable
 from copy import deepcopy
 
 load_dotenv()
+
+VALID_SPAWN_ID_CHARS = string.ascii_letters + string.digits
 
 # Only allow these Discord user IDs to interact with the bot.
 # You can list them in the ALLOWED_USER_IDS env var (comma-separated).
@@ -81,6 +85,32 @@ os.makedirs(CODEX_MASTER_DIR, exist_ok=True)
 CLEAN_CODEX_MASTER_DIR = os.getenv("CLEAN_CODEX_MASTER_DIR", 1)
 
 
+def log(*args, **kwargs):
+    if LOG_LEVEL:
+        print(*args, **kwargs, file=sys.stderr)
+
+
+def log_command_usage(func):
+    @functools.wraps(func)
+    async def wrapper(ctx: discord.ApplicationContext, *args, **kwargs):
+        log(f"Command '{func.__name__}' invoked by '{ctx.author.name}' (user {ctx.author.id})...")
+        return await func(ctx, *args, **kwargs)
+    
+    return wrapper
+
+
+def notify_on_internal_error(func):
+    @functools.wraps(func)
+    async def wrapper(message: discord.Message):
+        try:
+            return await func(message)
+        except Exception:
+            await message.channel.send("Internal error", reference=message)
+            raise
+
+    return wrapper
+
+
 def clean_master_dir():
     if NO_DOCKER or not CLEAN_CODEX_MASTER_DIR:
         return
@@ -90,10 +120,12 @@ def clean_master_dir():
     for agent_dir in os.listdir(CODEX_MASTER_DIR):
         agent_dir = os.path.join(CODEX_MASTER_DIR, agent_dir)
         if not any(sess_id in agent_dir for sess_id in live_session_ids):
+            log(f"Removing dead agent session dir {agent_dir}")
             shutil.rmtree(agent_dir)
 
 
 def save_spawns():
+    log("Saving spawns")
     spawns_to_save = {}
     for spawn_id, spawn in spawns.items():
         # temporarily remove the stuff that cannot be saved (and also not deepcopy'd)
@@ -118,8 +150,8 @@ def save_spawns():
 @bot.event
 async def on_ready():
     """Called when the bot is ready and connected to Discord."""
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("------")
+    log(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    log("------")
 
 
 # Global pre-check: only allow listed users to run slash commands
@@ -143,6 +175,7 @@ async def auto_defer(interaction: discord.Interaction):
     description="Greet me!",
     choices=["Hello, world!", "Hi there!", "Greetings!", "Howdy!"]
 )
+@log_command_usage
 async def hello(
     ctx: discord.ApplicationContext,
     greeting: str
@@ -230,8 +263,10 @@ async def default_run_proc_and_wait_completion_waiter(proc: asyncio.subprocess.P
 
 async def run_proc_and_wait(
     *args,
-    proc_completion_waiter: Callable[[asyncio.subprocess.Process], Awaitable[None]] = default_run_proc_and_wait_completion_waiter
+    proc_completion_waiter: Callable[[asyncio.subprocess.Process], Awaitable[None]] = default_run_proc_and_wait_completion_waiter,
+    silent_errors: bool = False,
 ):
+    log(f"Running {' '.join(args)}")
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
@@ -239,12 +274,16 @@ async def run_proc_and_wait(
         stderr=asyncio.subprocess.STDOUT,
     )
     await proc_completion_waiter(proc)
-    if proc.returncode != 0:
+    if proc.returncode not in (0, None):
         try:
-            raise RuntimeError(f"[ERROR IN SPAWNED PROCESS: EXIT CODE {proc.returncode}]: command {' '.join(args)} failed")
-        except RuntimeError:
-            print(traceback.format_exc(), file=sys.stderr)
-    return proc.returncode
+            raise RuntimeError(f"[ERROR IN SPAWNED PROCESS: EXIT CODE {proc.returncode}]: command failed")
+        except RuntimeError as e:
+            if silent_errors:
+                # Only log the message, not the traceback
+                log(str(e))
+            else:
+                log(traceback.format_exc())
+    return proc if proc.returncode is None else None
 
 
 def get_docker_container_name(spawn_id: str):
@@ -268,6 +307,10 @@ def get_auto_gen_env_vars() -> dict[str, str]:
 
 
 async def create_agent_docker_container(spawn_id: str, session_id: str, working_dir: str, leak_env: bool = False):
+    log(
+        f"Creating agent container for {spawn_id} and mounting to {working_dir}. Session ID is {session_id}."
+        + (" WARNING: env leak enabled." if leak_env else "")
+    )
     auto_gen_env_vars = get_auto_gen_env_vars()
     env_var_setters = env_var_dict_to_setters(auto_gen_env_vars)
 
@@ -284,7 +327,8 @@ async def create_agent_docker_container(spawn_id: str, session_id: str, working_
         "docker",
         "create",
         "--name", get_docker_container_name(spawn_id),
-        "--cap-add=NET_ADMIN",
+        # "--userns=keep-id",  # extra safety (makes root in container != host root)
+        "--cap-add=NET_ADMIN",  # required for setting up firewall rules
         "--cpus", str(MAX_CPU_USAGE),
         "--memory", f"{MAX_RAM_USAGE_GB}g",
         "-v", f"{working_dir}:{working_dir}",
@@ -294,16 +338,20 @@ async def create_agent_docker_container(spawn_id: str, session_id: str, working_
         CODEX_DOCKER_IMAGE_NAME,
     ]
     await run_proc_and_wait(*docker_args)
+    log("DONE: docker create")
 
 
 async def start_agent_docker_container_proc_completion_waiter(proc: asyncio.subprocess.Process):
     """Special logic that awaits the completion of the start command. Instead of waiting forever, we wait until it prints '[==== DONE ====]'."""
     async for line in proc.stdout:
+        log("New line from entrypoint.sh:", line.decode('utf-8', errors="replace"))
         if b"[==== DONE ====]" in line:
-            break
+            return
+    raise RuntimeError("`docker start -a spawn_id` exited unexpectedly")
 
 
 async def start_agent_docker_container(spawn_id: str):
+    log(f"Starting docker container for {spawn_id}")
     docker_args = [
         "docker",
         "start",
@@ -316,25 +364,30 @@ async def start_agent_docker_container(spawn_id: str):
         *docker_args,
         proc_completion_waiter=start_agent_docker_container_proc_completion_waiter
     )
+    log(f"DONE: docker start")
 
 
-async def stop_agent_docker_container(spawn_id: str):
+async def stop_agent_docker_container(spawn_id: str, silent_errors: bool = False):
+    log(f"Force-stopping docker container for {spawn_id}")
     docker_args = [
         "docker",
         "stop",
         "-t", "5",
         get_docker_container_name(spawn_id),
     ]
-    await run_proc_and_wait(*docker_args)
+    await run_proc_and_wait(*docker_args, silent_errors=True)
+    log(f"DONE: docker stop")
 
 
 async def delete_agent_docker_container(spawn_id: str):
+    log(f"Removing docker container for {spawn_id}")
     docker_args = [
         "docker",
         "rm",
         get_docker_container_name(spawn_id),
     ]
     await run_proc_and_wait(*docker_args)
+    log("DONE: docker rm")
 
 
 async def launch_agent(
@@ -349,6 +402,7 @@ async def launch_agent(
     assert not leak_env or ALLOW_LEAK_ENV
 
     if NO_DOCKER:
+        log(f"Launching agent {spawn_id} WITHOUT docker...")
         optional_docker_prefix = []
         cli_script_abspath = os.path.join(BOT_WORKING_DIR, "third_party/codex-headless/dist/cli.mjs")
         if leak_env:
@@ -359,6 +413,7 @@ async def launch_agent(
             # Empty env dict might be interpreted as "inherit all"
             proc_env = {"__ENV_LEAK_DISABLED": 1}
     else:
+        log(f"Launching agent {spawn_id} in docker container...")
         proc_env = None  # docker itself gets all host env vars
 
         # Start docker container first (non-blocking)
@@ -374,6 +429,7 @@ async def launch_agent(
         cli_script_abspath = "/CodexMaster/third_party/codex-headless/dist/cli.mjs"
         working_dir = None  # launch docker itself in current working dir
 
+    log("Launching codex...")
     args = optional_docker_prefix + [
         "node",
         cli_script_abspath,
@@ -397,6 +453,7 @@ async def launch_agent(
 
 @bot.slash_command(name="set_instructions", description="Sets the instructions that will be passed to ALL Codex Agents spawned from now on")
 @option("new_instructions", description="The new instructions")
+@log_command_usage
 async def set_instructions(ctx: discord.ApplicationContext, new_instructions: str):
     """Sets the instructions on which ALL Agents operate."""
     global instructions
@@ -406,15 +463,26 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 
 @bot.slash_command(name="spawn", description="Reserve a spawn ID for Codex prompts")
 @option("spawn_id", description="The ID under which you will reference the Codex Instance")
+@option("working_dir", description="The working directory for the agent to work in")
 @option("provider", description="The Provider to use")
 @option("model", description="The model to use")
-@option("working_dir", description="The working directory for the agent to work in")
 @option("leak_env", description="If set, leaks the env vars from the host system into the Codex container")
-async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, working_dir: str = DEFAULT_WORKING_DIR, leak_env: bool = False):
+@log_command_usage
+async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, leak_env: bool = False):
     """Registers a unique spawn ID that can be used for future prompts."""
     if spawn_id in spawns:
         await ctx.respond(
             f"❌ Spawn ID **{spawn_id}** is already in use."
+        )
+        return
+    if len(spawn_id) > 64:
+        await ctx.respond(
+            f"❌ Spawn ID **{spawn_id}** too long - must be at most 64 characters, but is {len(spawn_id)}."
+        )
+        return
+    if not all(c in VALID_SPAWN_ID_CHARS for c in spawn_id):
+        await ctx.respond(
+            f"❌ Spawn ID **{spawn_id}** contains invalid characters - only '{VALID_SPAWN_ID_CHARS}' allowed."
         )
         return
     provider = provider.strip()
@@ -463,6 +531,7 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, provider: str = 
 @bot.slash_command(name="set_provider", description="Change the provider for an already existing Agent")
 @option("spawn_id", description="The ID of the Agent")
 @option("provider", description="The Provider to use")
+@log_command_usage
 async def set_provider(ctx: discord.ApplicationContext, spawn_id: str, provider: str = DEFAULT_PROVIDER):
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID **{spawn_id}**.")
@@ -480,6 +549,7 @@ async def set_provider(ctx: discord.ApplicationContext, spawn_id: str, provider:
 @bot.slash_command(name="set_model", description="Change the model for an already existing Agent")
 @option("spawn_id", description="The ID of the Agent")
 @option("model", description="The model to use")
+@log_command_usage
 async def set_model(ctx: discord.ApplicationContext, spawn_id: str, model: str = DEFAULT_MODEL):
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID **{spawn_id}**.")
@@ -501,6 +571,8 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
         if delete:
             append_msg = f" (permanently deleted agent **{spawn_id}**)."
             if not NO_DOCKER:
+                # Stop container (without printing a full-blown traceback if not running)
+                await stop_agent_docker_container(spawn_id, silent_errors=True)
                 await delete_agent_docker_container(spawn_id)
             del spawns[spawn_id]
         save_spawns()
@@ -541,25 +613,28 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
 @option("spawn_id", description="The spawn ID to kill processes for")
 @option("delete", description="Delete it fully?", type=bool)
 @option("revert_chat_state", description="Revert the chat state to before you sent your last message?", type=bool)
+@log_command_usage
 async def kill(ctx: discord.ApplicationContext, spawn_id: str, delete: bool = False, revert_chat_state: bool = True):
     return await kill_impl(ctx, spawn_id, delete, revert_chat_state)
 
 
 @bot.slash_command(name="delete_all_agents", description="Delete spawns.json")
 @option("confirmation", description="Type CONFIRM to confirm the action")
+@log_command_usage
 async def del_spawns_file(ctx: discord.ApplicationContext, confirmation: str):
     if confirmation != "CONFIRM":
         await ctx.respond("❌ You must confirm this action by typing CONFIRM in the confirmation field")
         return
     spawn_ids = set(spawns)
     for spawn_id in spawn_ids:
-        await kill_impl(ctx, spawn_id, True)
+        await kill_impl(ctx, spawn_id, delete=True)
     if os.path.exists("spawns.json"):
         os.remove("spawns.json")
     await ctx.respond("✅ Killed and deleted all agents and docker containers - EVERYTHING!")
 
 
 @bot.slash_command(name="list", description="List active workers and their processes with PID and runtime")
+@log_command_usage
 async def list_spawns(ctx: discord.ApplicationContext):
     """Lists all spawn IDs and their active processes, showing PID and runtime."""
     if not spawns:
@@ -656,7 +731,7 @@ def send_codex_notification(worker_entry: dict, msg: str, reference=None):
                 messages = [format_command_output(out_inner)]
             action = ' got result'
     except Exception:
-        print(traceback.format_exc(), file=sys.stderr)
+        log(traceback.format_exc())
 
     for m in messages:
         send_notification(worker_entry, m, reference=reference, action=action)
@@ -709,6 +784,7 @@ def get_history_item_content(item: dict):
 
 
 @bot.event
+@notify_on_internal_error
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
@@ -730,6 +806,7 @@ async def on_message(message: discord.Message):
         )
         return
 
+    log(f"Received valid and authorized request to send a message to agent {spawn_id}...")
     entry = spawns[spawn_id]
     entry['user'] = message.author
     entry['channel'] = message.channel
@@ -757,8 +834,7 @@ async def on_message(message: discord.Message):
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
 
     async def reader():
-        if LOG_LEVEL:
-            print("Spawning process", file=sys.stderr)
+        log(f"Spawning reader routine for agent {spawn_id}")
 
         notifications: list[dict] = []
         async for line in proc.stdout:
@@ -766,9 +842,8 @@ async def on_message(message: discord.Message):
             try:
                 line_json = json.loads(line)
             except json.JSONDecodeError:
-                if LOG_LEVEL:
-                    print("[ERROR] New line from process:", line, file=sys.stderr)
-                print(traceback.format_exc(), file=sys.stderr)
+                log("[ERROR] New line from process:", line)
+                log(traceback.format_exc())
                 continue
             notifications.append(line_json)
 
@@ -783,21 +858,18 @@ async def on_message(message: discord.Message):
                 content = get_history_item_content(line_json)
                 if content == prev_content:
                     ignore_this = True
-                    if LOG_LEVEL:
-                        print("[IGNORED] New line from process:", line, file=sys.stderr)
+                    log("[IGNORED] New line from process:", line)
                     break
             if ignore_this:
                 continue
 
-            if LOG_LEVEL:
-                print("New line from process:", line, file=sys.stderr)
+            log("New line from process:", line)
 
             send_codex_notification(entry, line, reference=message)
 
         # Send termination notification
         send_notification(entry, f"AGENT **{spawn_id}** COMPLETED HIS MISSION!", critical=True, reference=message)
-        if LOG_LEVEL:
-            print("Retiring process", file=sys.stderr)
+        log(f"Retiring reader routine for agent {spawn_id}")
 
         # Stop container
         if not NO_DOCKER:
@@ -809,13 +881,11 @@ async def on_message(message: discord.Message):
         # Example: empty reasoning summary messages.
         # However, revert content if we were killed.
         if proc in newly_killed_procs:
-            if LOG_LEVEL:
-                print(f"Reverting session file for ID {session_id}", file=sys.stderr)
+            log(f"Reverting session file for ID {session_id}")
             newly_killed_procs.remove(proc)
             write_session_file(session_id, prev_sess_items_og)
         else:
-            if LOG_LEVEL:
-                print(f"Updating session file for ID {session_id}", file=sys.stderr)
+            log(f"Updating session file for ID {session_id}")
             write_session_file(session_id, notifications)
         
         # Remove this process from entry["processes"]
@@ -832,7 +902,7 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        print("Error: DISCORD_BOT_TOKEN environment variable not set.", file=sys.stderr)
-        exit(1)
+        log("Error: DISCORD_BOT_TOKEN environment variable not set.")
+        sys.exit(1)
     bot.run(token)
 

@@ -20,7 +20,7 @@ By default, the bot will spawn Codex CLI in a docker container. You can disable 
 
 - python (required) >= 3.9
 - node.js (required) >= 22
-- docker (recommended): If you want to run Codex in a docker container to minimize potential damage. I recommend rootless docker.
+- docker (recommended) >= 21: If you want to run Codex in a docker container to minimize potential damage. I recommend rootless docker.
 
 ## More details
 

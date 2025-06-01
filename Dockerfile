@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     man-db \
     # ------------ Privilege & CI helpers ------------ \
-    gosu \
+    util-linux \
     gnupg \
     gh \
     # ---------------- Compression ------------------- \

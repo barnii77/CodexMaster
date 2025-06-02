@@ -63,8 +63,5 @@ RUN chmod +x /CodexMaster/third_party/codex-headless/dist/cli.mjs
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Inside docker, Codex CLI can't find landlock or similar sandboxing mechanisms (but it's already sandboxed)
-ENV CODEX_UNSAFE_ALLOW_NO_SANDBOX=1
-
 # Entrypoint handles switching to non-root user, setting up firewall rules, etc.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -22,7 +22,7 @@ This document describes how to install, configure, and run CodexMaster, a self-h
 ## 1. Clone the repository
 
 ```bash
-git clone https://git.barnii77.dev/CodexMaster
+git clone https://git.barnii77.dev/barnii77/CodexMaster
 # or git clone https://github.com/barnii77/CodexMaster
 cd CodexMaster
 ```

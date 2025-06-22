@@ -6,6 +6,10 @@
 
 Simply put, it's a discord frontend for Codex CLI (or rather, [my fork](https://github.com/barnii77/codex-headless) of it). It does a bit more than that though, because you can spawn and manage multiple agents at once, so it's actually more like the cloud based Codex in ChatGPT, I think.
 
+You can also use it with Claude Code by adding an `ANTHROPIC_API_KEY` to your `codex.env` file and specifying `claude` as the backend (and an appropriate anthropic model) when creating an agent.
+Note that Claude Code is run with `--dangerously-skip-permissions` as root (inside the container, which, using rootless docker, is just your normal user). Since this is not possible in normal
+Claude Code, this project uses a modded version of `v1.0.31`. More on this at [third_party/claude-code-unrestricted/README.md](third_party/claude-code-unrestricted/README.md).
+
 # How to use
 
 Roughly, you have to

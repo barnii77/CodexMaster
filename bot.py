@@ -86,6 +86,11 @@ os.makedirs(CODEX_MASTER_DIR, exist_ok=True)
 CLEAN_CODEX_MASTER_DIR = os.getenv("CLEAN_CODEX_MASTER_DIR", 1)
 
 
+class ToolBackend:
+    CODEX_HEADLESS = "codex"
+    CLAUDE_CODE = "claude"
+
+
 def log(*args, **kwargs):
     if LOG_LEVEL:
         print(*args, **kwargs, file=sys.stderr)
@@ -225,9 +230,19 @@ def repair_session_items(items: list[dict]) -> list[dict]:
     return items
 
 
-def write_session_file(session_id: str, items: list[dict]):
+def get_claude_json_path(session_id: str) -> str:
+    claude_json_dir = os.path.join(CODEX_MASTER_DIR, session_id)
+    os.makedirs(claude_json_dir, exist_ok=True)
+    claude_json_path = os.path.join(claude_json_dir, ".claude.json")
+    return claude_json_path
+
+
+def write_session_file(session_id: str, items: list[dict], backend: str):
     path = get_session_file_path(session_id)
-    items = repair_session_items(items)
+    try:
+        items = repair_session_items(items)
+    except Exception:
+        pass
     content = deepcopy(session_json_template)
     content['session']['id'] = session_id
     timestamp = datetime.datetime.now().isoformat('T', 'milliseconds') + 'Z'
@@ -236,6 +251,13 @@ def write_session_file(session_id: str, items: list[dict]):
     content['items'] = items
     with open(path, 'w') as f:
         json.dump(content, f)
+    if backend == ToolBackend.CLAUDE_CODE:
+        assert backend == ToolBackend.CLAUDE_CODE
+        with open("claude.json.template") as f:
+            templ = f.read()
+        claude_json_path = get_claude_json_path(session_id)
+        with open(claude_json_path, 'w') as f:
+            f.write(templ)
 
 
 def init_agent_codex_dir(session_id: str):
@@ -253,9 +275,9 @@ def init_agent_codex_dir(session_id: str):
         shutil.copy2(CODEX_MASTER_AGENTS_MD_PATH, os.path.join(agent_dir, "AGENTS.md"))
 
 
-def init_session_file(session_id: str):
+def init_session_file(session_id: str, backend: str):
     init_agent_codex_dir(session_id)
-    write_session_file(session_id, [])
+    write_session_file(session_id, [], backend)
 
 
 async def default_run_proc_and_wait_completion_waiter(proc: asyncio.subprocess.Process):
@@ -307,7 +329,7 @@ def get_auto_gen_env_vars() -> dict[str, str]:
     }
 
 
-async def create_agent_docker_container(spawn_id: str, session_id: str, working_dir: str, leak_env: bool = False):
+async def create_agent_docker_container(spawn_id: str, session_id: str, working_dir: str, leak_env: bool = False, backend: str = ToolBackend.CODEX_HEADLESS):
     log(
         f"Creating agent container for {spawn_id} and mounting to {working_dir}. Session ID is {session_id}."
         + (" WARNING: env leak enabled." if leak_env else "")
@@ -321,14 +343,18 @@ async def create_agent_docker_container(spawn_id: str, session_id: str, working_
     if CODEX_ENV_FILE is not None:
         env_var_setters.extend(["--env-file", CODEX_ENV_FILE])
 
-    agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
-    dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".codex")
+    if backend == ToolBackend.CODEX_HEADLESS:
+        agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
+        dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".codex")
+    else:
+        assert backend == ToolBackend.CLAUDE_CODE
+        agent_dir = get_claude_json_path(session_id)
+        dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".claude.json")
 
     docker_args = [
         "docker",
         "create",
         "--name", get_docker_container_name(spawn_id),
-        # "--userns=keep-id",  # extra safety (makes root in container != host root)
         "--cap-add=NET_ADMIN",  # required for setting up firewall rules
         "--cpus", str(MAX_CPU_USAGE),
         "--memory", f"{MAX_RAM_USAGE_GB}g",
@@ -399,6 +425,7 @@ async def launch_agent(
     model: str,
     working_dir: str,
     leak_env: bool = False,
+    backend: str = ToolBackend.CODEX_HEADLESS,
 ):
     assert not leak_env or ALLOW_LEAK_ENV
 
@@ -423,24 +450,40 @@ async def launch_agent(
         optional_docker_prefix = [
             "docker",
             "exec",
+        ] + ([
             "-i",  # leaves stdin open (required by codex cli even in quiet mode for whatever reason)
-            "-u", getpass.getuser(),
+        ] if backend == ToolBackend.CODEX_HEADLESS else []) + [
+            # "-u", getpass.getuser(),
             get_docker_container_name(spawn_id),
         ]
-        cli_script_abspath = "/CodexMaster/third_party/codex-headless/dist/cli.mjs"
+        cli_script_abspath = "/app/third_party/codex-headless/dist/cli.mjs"
         working_dir = None  # launch docker itself in current working dir
 
-    log("Launching codex...")
-    args = optional_docker_prefix + [
-        "node",
-        cli_script_abspath,
-        "-q", prompt,
-        "--session-id", session_id,
-        # "--update-session-file", "false",
-        "--full-auto",
-        "--provider", provider,
-        "-m", model,
-    ]
+    log(f"Launching {backend}...")
+    if backend == ToolBackend.CODEX_HEADLESS:
+        args = optional_docker_prefix + [
+            "node",
+            cli_script_abspath,
+            "-q", prompt,
+            "--session-id", session_id,
+            # "--update-session-file", "false",
+            "--full-auto",
+            "--provider", provider,
+            "-m", model,
+        ]
+    else:
+        assert backend == ToolBackend.CLAUDE_CODE
+        args = optional_docker_prefix + [
+            "/usr/local/bin/claude",
+            "-p", prompt,
+            "--dangerously-skip-permissions",
+            "--verbose",
+            "--output-format", "stream-json",
+            "--model", model,
+            "--continue",
+        ]
+
+    log(f"launch_agent: running async command `{' '.join(args)}`")
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
@@ -467,9 +510,11 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 @option("working_dir", description="The working directory for the agent to work in")
 @option("provider", description="The Provider to use")
 @option("model", description="The model to use")
-@option("leak_env", description="If set, leaks the env vars from the host system into the Codex container")
+@option("leak_env", description="If set to true, leaks the env vars from the host system into the Codex container")
+@option("allow_create_working_dir", description="If set to true, it will create the working dir if it does not exist")
+@option("backend", choices=["codex", "claude"], description="Whether to use codex-headless or claude code as the underlying tool")
 @log_command_usage
-async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, leak_env: bool = False):
+async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, leak_env: bool = False, allow_create_working_dir: bool = True, backend: str = ToolBackend.CODEX_HEADLESS):
     """Registers a unique spawn ID that can be used for future prompts."""
     if spawn_id in spawns:
         await ctx.respond(
@@ -499,19 +544,35 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str
         )
         return
     if not os.path.exists(working_dir) or not os.path.isdir(working_dir):
-        await ctx.respond(
-            f"❌ Working Dir '{working_dir}' does not exist."
-        )
-        return
+        if allow_create_working_dir:
+            os.makedirs(working_dir)
+            await ctx.respond(
+                f"ℹ️ Creating '{working_dir}'."
+            )
+        else:
+            await ctx.respond(
+                f"❌ Working Dir '{working_dir}' does not exist."
+            )
+            return
     if not ALLOW_LEAK_ENV and leak_env:
         await ctx.respond(
             f"❌ leak_env=True has been configured as disallowed."
         )
         return
+    if backend not in (ToolBackend.CODEX_HEADLESS, ToolBackend.CLAUDE_CODE):
+        await ctx.respond(
+            f"❌ Unknown backend {backend}."
+        )
+        return
+    if backend == ToolBackend.CLAUDE_CODE and NO_DOCKER:
+        await ctx.respond(
+            f"❌ Claude code backend is only supported when running in docker mode, which this bot is not."
+        )
+        return
     session_id = get_random_id()
-    init_session_file(session_id)
+    init_session_file(session_id, backend)
     if not NO_DOCKER:
-        await create_agent_docker_container(spawn_id, session_id, working_dir, leak_env)
+        await create_agent_docker_container(spawn_id, session_id, working_dir, leak_env, backend)
     spawns[spawn_id] = {
         "spawn_id": spawn_id,
         "session_id": session_id,
@@ -519,6 +580,7 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str
         "model": model.strip(),
         "working_dir": working_dir,
         "leak_env": leak_env,
+        "backend": backend,
         "channel": ctx.channel,
         "user": ctx.author,
         "processes": []
@@ -825,15 +887,16 @@ async def on_message(message: discord.Message):
     if provider not in ALLOWED_PROVIDERS:
         provider = DEFAULT_PROVIDER
     model = entry.get("model", DEFAULT_MODEL).strip()
+    backend = entry.get("backend", ToolBackend.CODEX_HEADLESS)
     working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
     leak_env = entry.get("leak_env", False)
-    proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir, leak_env)
+    proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir, leak_env, backend)
     
     await message.channel.send(f"✅ AGENT **{spawn_id}** DEPLOYED...", reference=message)
 
     sess_fp = get_session_file_path(session_id)
     if not os.path.exists(sess_fp):
-        init_session_file(session_id)
+        init_session_file(session_id, backend)
     with open(sess_fp) as f:
         sess = json.load(f)
     prev_sess_items_og = deepcopy(sess['items'])
@@ -847,6 +910,7 @@ async def on_message(message: discord.Message):
 
         notifications: list[dict] = []
         async for line in proc.stdout:
+            log("new line from proc")  # TODO remove
             line = line.strip().decode('utf-8')
             try:
                 line_json = json.loads(line)
@@ -859,9 +923,11 @@ async def on_message(message: discord.Message):
             # Ignore messages that were part of the session file (that will be re-printed) by
             # matchig their content against what is printed (not all will be printed for some reason).
             # This assumes that all messages that will be printed (up until the new user message) are
-            # part of the session file as well.
+            # part of the session file as well. NOTE: This behavior is Codex-only.
             ignore_this = False
-            while prev_sess_items:
+            log(f"Reader routine for agent {spawn_id}: Filtering repeated previous messages...")  # TODO remove
+            while prev_sess_items and backend == ToolBackend.CODEX_HEADLESS:
+                log(f"branch reached")  # TODO remove
                 prev_item = prev_sess_items.pop(0)
                 prev_content = get_history_item_content(prev_item)
                 content = get_history_item_content(line_json)
@@ -892,10 +958,10 @@ async def on_message(message: discord.Message):
         if proc in newly_killed_procs:
             log(f"Reverting session file for ID {session_id}")
             newly_killed_procs.remove(proc)
-            write_session_file(session_id, prev_sess_items_og)
+            write_session_file(session_id, prev_sess_items_og, backend)
         else:
             log(f"Updating session file for ID {session_id}")
-            write_session_file(session_id, notifications)
+            write_session_file(session_id, notifications, backend)
         
         # Remove this process from entry["processes"]
         entry_procs = entry["processes"]

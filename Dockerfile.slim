@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     python3 \
     python3-pip \
+    python3-venv \
     aggregate \
     # -------------- Editors & shells ---------------- \
     vim \
@@ -53,15 +54,40 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
+# No need to install claude code using NPM because we provide our own modded version
+RUN npm install -g @anthropic-ai/claude-code@1.0.31
+
+# Create and activate venv and install dependencies
+RUN mkdir -p /app
+RUN python3 -m venv /app/.venv
+RUN bash -c "source /app/.venv/bin/activate && pip install pydantic_extra_types==2.10.3 pydantic==2.10.6 mcp==1.3.0 tzdata==2025.1 openai==1.66.2 typer==0.15.2"
+
 # Copy the dist folder for codex-headless
-COPY ./third_party/codex-headless/dist/ /CodexMaster/third_party/codex-headless/dist/
-RUN chmod +x /CodexMaster/third_party/codex-headless/dist/bin/codex-linux-sandbox-x64
-RUN chmod +x /CodexMaster/third_party/codex-headless/dist/bin/codex-linux-sandbox-arm64
-RUN chmod +x /CodexMaster/third_party/codex-headless/dist/cli.mjs
+COPY ./third_party/codex-headless/dist/ /app/third_party/codex-headless/dist/
+RUN chmod +x /app/third_party/codex-headless/dist/bin/codex-linux-sandbox-x64
+RUN chmod +x /app/third_party/codex-headless/dist/bin/codex-linux-sandbox-arm64
+RUN chmod +x /app/third_party/codex-headless/dist/cli.mjs
+COPY ./third_party/claude-code-unrestricted/claude /usr/local/bin/claude
+RUN chmod +x /usr/local/bin/claude
+
+# Copy custom tools for Codex (python scripts invoked through terminal).
+# No extension so it can be called like `web_search -q "query"`
+COPY ./tools/web_search.py /app/tools/web_search.py
+RUN chmod +x /app/tools/web_search.py
+
+# Create symlink in /usr/local/bin for all tools
+RUN ln -s /app/tools/web_search.py /usr/local/bin/web_search
+
+# Copy the server.py file from openai-websearch-mcp
+COPY ./third_party/openai-websearch-mcp/server.py /app/third_party/openai-websearch-mcp/server.py
 
 # Copy the entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Copy script to launch background services (e.g. MCP servers)
+COPY launch_services.sh /usr/local/bin/launch_services.sh
+RUN chmod +x /usr/local/bin/launch_services.sh
 
 # Entrypoint handles switching to non-root user, setting up firewall rules, etc.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

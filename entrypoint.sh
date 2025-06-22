@@ -90,6 +90,7 @@ exec setpriv \
      --ambient-caps -all \
      --inh-caps -all \
      -- /bin/bash -c '
+           /usr/local/bin/launch_services.sh
            echo "[==== DONE ====]"  # sentinel printed AFTER capabilities drop
            if [ "$#" -gt 0 ]; then
                exec "$@"

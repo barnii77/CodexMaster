@@ -6,6 +6,12 @@
 
 Simply put, it's a discord frontend for Claude Code, Codex CLI and Gemini CLI. It does a bit more than that though, because you can spawn and manage multiple agents at once, so it's actually more like the cloud based Codex in ChatGPT, I think.
 
+### Why would you even need this?
+
+Well, I don't know about you, but I don't always have immediate access to a terminal where I can run all of these tools in a properly isolated environment.
+
+### Some more info
+
 Note that I have a custom version of all of these command line tools. You can find them in `third_party/`. This is because none of them quite supported all the features I need for this bot out of the box. The closest was probably claude code, which provides a headless mode that actually supports all the tool's features. Still, I had to make a custom modded version of it to remove an artificial limitation (for "safety reasons") that is irrelevant when you run inside of docker. More on that below.
 
 You can use it with Claude Code by adding an `ANTHROPIC_API_KEY` to your `codex.env` file and specifying `claude` as the backend (and an appropriate anthropic model) when creating an agent.

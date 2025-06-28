@@ -1,3 +1,6 @@
 py-cord
 python-dotenv
 asyncio
+aiohttp
+aiofiles
+werkzeug

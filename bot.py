@@ -10,6 +10,8 @@ import shutil
 import getpass
 import functools
 import string
+import aiohttp
+import aiofiles
 
 import discord
 from discord import option
@@ -17,6 +19,8 @@ from discord.ext import commands
 from dotenv import load_dotenv, dotenv_values
 from typing import Optional, Callable, Awaitable
 from copy import deepcopy
+from werkzeug.utils import secure_filename
+from werkzeug.security import safe_join
 
 load_dotenv()
 
@@ -343,13 +347,19 @@ async def create_agent_docker_container(spawn_id: str, session_id: str, working_
     if CODEX_ENV_FILE is not None:
         env_var_setters.extend(["--env-file", CODEX_ENV_FILE])
 
-    if backend == ToolBackend.CODEX_HEADLESS:
-        agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
-        dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".codex")
-    else:
-        assert backend == ToolBackend.CLAUDE_CODE
-        agent_dir = get_claude_json_path(session_id)
-        dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".claude.json")
+    agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
+    dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".codex")
+
+    mounts = [
+        "-v", f"{working_dir}:{working_dir}",
+        "-v", f"{agent_dir}:{dot_codex_dir_in_docker}",
+    ]
+
+    if backend == ToolBackend.CLAUDE_CODE:
+        claude_json_path = get_claude_json_path(session_id)
+        claude_json_path_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".claude.json")
+        mounts.append("-v")
+        mounts.append(f"{claude_json_path}:{claude_json_path_in_docker}")
 
     docker_args = [
         "docker",
@@ -358,8 +368,7 @@ async def create_agent_docker_container(spawn_id: str, session_id: str, working_
         "--cap-add=NET_ADMIN",  # required for setting up firewall rules
         "--cpus", str(MAX_CPU_USAGE),
         "--memory", f"{MAX_RAM_USAGE_GB}g",
-        "-v", f"{working_dir}:{working_dir}",
-        "-v", f"{agent_dir}:{dot_codex_dir_in_docker}",
+    ] + mounts + [
         "-w", working_dir,
         *env_var_setters,
         CODEX_DOCKER_IMAGE_NAME,
@@ -832,18 +841,85 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
     ping = f"<@{user_id}> " if critical else ""
 
     msg = f"{ping}**{spawn_id}**{action}:\n{notification}"
-    msg = close_unterminated_code_blocks(msg[:DISCORD_CHARACTER_LIMIT]) + (
-        f"\n\n... ({len(msg[DISCORD_CHARACTER_LIMIT:].splitlines())} lines left)"
-        if len(msg) >= DISCORD_CHARACTER_LIMIT
-        else ""
-    )
 
-    coro = channel.send(msg, reference=reference)
-    asyncio.run_coroutine_threadsafe(coro, bot.loop)
+    is_first_iter = True
+    while msg:
+        msg_piece = close_unterminated_code_blocks(msg[:DISCORD_CHARACTER_LIMIT]) + (
+            f"\n\n... ({len(msg[DISCORD_CHARACTER_LIMIT:].splitlines())} lines left)"
+            if len(msg) >= DISCORD_CHARACTER_LIMIT
+            else ""
+        )
+        msg = msg[DISCORD_CHARACTER_LIMIT:]
+        if not is_first_iter:
+            # Put the bulk of long messages into code blocks
+            msg_piece = f"```\n{msg_piece}\n```"
+
+        coro = channel.send(msg_piece, reference=reference)
+        asyncio.run_coroutine_threadsafe(coro, bot.loop)
+        is_first_iter = False
 
 
 def get_history_item_content(item: dict):
     return item.get('content') or item.get('summary') or item.get('output') or item['action']['command']
+
+
+async def save_message_attachments(message, save_directory):
+    """Save all attachments from a Discord message"""
+
+    # Create directory if it doesn't exist
+    os.makedirs(save_directory, exist_ok=True)
+
+    if not message.attachments:
+        print("No attachments found")
+        return []
+
+    saved_files = []
+
+    async with aiohttp.ClientSession() as session:
+        for attachment in message.attachments:
+            try:
+                # Secure the filename
+                safe_filename = secure_filename(attachment.filename)
+                if not safe_filename:
+                    safe_filename = f"attachment_{attachment.id}"
+
+                # Use safe_join to prevent directory traversal
+                filepath = safe_join(save_directory, safe_filename)
+                if filepath is None:
+                    print(f"Unsafe path detected for {attachment.filename}, skipping")
+                    continue
+
+                # Handle duplicates
+                counter = 1
+                original_filepath = filepath
+                while os.path.exists(filepath):
+                    name, ext = os.path.splitext(safe_filename)
+                    duplicate_filename = f"{name}_{counter}{ext}"
+                    filepath = safe_join(save_directory, duplicate_filename)
+                    if filepath is None:
+                        break
+                    counter += 1
+
+                if filepath is None:
+                    print(f"Could not create safe path for {attachment.filename}")
+                    continue
+
+                # Download the file
+                async with session.get(attachment.url) as response:
+                    if response.status == 200:
+                        async with aiofiles.open(filepath, 'wb') as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                await f.write(chunk)
+
+                        saved_files.append(filepath)
+                        print(f"Saved: {os.path.basename(filepath)} ({attachment.size} bytes)")
+                    else:
+                        print(f"Failed to download {attachment.filename}: HTTP {response.status}")
+
+            except Exception as e:
+                print(f"Error saving {attachment.filename}: {e}")
+
+    return saved_files
 
 
 @bot.event
@@ -878,6 +954,7 @@ async def on_message(message: discord.Message):
         return
 
     log(f"Received valid and authorized request to send a message to agent {spawn_id}...")
+
     entry = spawns[spawn_id]
     entry['user'] = message.author
     entry['channel'] = message.channel
@@ -890,8 +967,22 @@ async def on_message(message: discord.Message):
     backend = entry.get("backend", ToolBackend.CODEX_HEADLESS)
     working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
     leak_env = entry.get("leak_env", False)
+
+    # Upload attachments and append `Uploaded attachments:\n- attachment1_path\n- attachment2_path\n...` to prompt
+    if message.attachments:
+        agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
+        attachments_dir = os.path.join(agent_dir, "uploads")
+        log(f"Saving attachments to {attachments_dir}...")
+        await save_message_attachments(message, attachments_dir)
+        log(f"Done saving attachments!")
+        prompt += "\n\nUploaded attachments:"
+        for attachment in message.attachments:
+            safe_filename = secure_filename(attachment.filename)
+            filepath = safe_join("~/.codex/uploads", safe_filename)
+            prompt += f"\n- {filepath}"
+
+    # Start the agent
     proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir, leak_env, backend)
-    
     await message.channel.send(f"✅ AGENT **{spawn_id}** DEPLOYED...", reference=message)
 
     sess_fp = get_session_file_path(session_id)
@@ -910,7 +1001,6 @@ async def on_message(message: discord.Message):
 
         notifications: list[dict] = []
         async for line in proc.stdout:
-            log("new line from proc")  # TODO remove
             line = line.strip().decode('utf-8')
             try:
                 line_json = json.loads(line)
@@ -925,9 +1015,7 @@ async def on_message(message: discord.Message):
             # This assumes that all messages that will be printed (up until the new user message) are
             # part of the session file as well. NOTE: This behavior is Codex-only.
             ignore_this = False
-            log(f"Reader routine for agent {spawn_id}: Filtering repeated previous messages...")  # TODO remove
             while prev_sess_items and backend == ToolBackend.CODEX_HEADLESS:
-                log(f"branch reached")  # TODO remove
                 prev_item = prev_sess_items.pop(0)
                 prev_content = get_history_item_content(prev_item)
                 content = get_history_item_content(line_json)

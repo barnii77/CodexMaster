@@ -55,6 +55,7 @@ ALLOW_LEAK_ENV = bool(os.getenv("ALLOW_LEAK_ENV", False))
 # performance settings
 MAX_CPU_USAGE = float(os.getenv("MAX_CPU_USAGE", 1.0))
 MAX_RAM_USAGE_GB = float(os.getenv("MAX_RAM_USAGE_GB", 4.0))
+DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = bool(os.getenv("DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND", False))
 
 with open("session_json_template.json") as f:
     session_json_template = json.load(f)
@@ -93,6 +94,7 @@ CLEAN_CODEX_MASTER_DIR = os.getenv("CLEAN_CODEX_MASTER_DIR", 1)
 class ToolBackend:
     CODEX_HEADLESS = "codex"
     CLAUDE_CODE = "claude"
+    GEMINI_CLI = "gemini"
 
 
 def log(*args, **kwargs):
@@ -256,7 +258,6 @@ def write_session_file(session_id: str, items: list[dict], backend: str):
     with open(path, 'w') as f:
         json.dump(content, f)
     if backend == ToolBackend.CLAUDE_CODE:
-        assert backend == ToolBackend.CLAUDE_CODE
         with open("claude.json.template") as f:
             templ = f.read()
         claude_json_path = get_claude_json_path(session_id)
@@ -480,8 +481,7 @@ async def launch_agent(
             "--provider", provider,
             "-m", model,
         ]
-    else:
-        assert backend == ToolBackend.CLAUDE_CODE
+    elif backend == ToolBackend.CLAUDE_CODE:
         args = optional_docker_prefix + [
             "/usr/local/bin/claude",
             "-p", prompt,
@@ -491,6 +491,17 @@ async def launch_agent(
             "--model", model,
             "--continue",
         ]
+    elif backend == ToolBackend.GEMINI_CLI:
+        sess_fp = os.path.expanduser("~/.gemini_session.json")
+        args = optional_docker_prefix + [
+            "/app/third_party/gemini-cli/bundle/gemini.js",
+            "-p", prompt,
+            "--session", sess_fp,
+            "--json",
+            "--yolo",
+        ]
+    else:
+        raise RuntimeError("unreachable")
 
     log(f"launch_agent: running async command `{' '.join(args)}`")
     proc = await asyncio.create_subprocess_exec(
@@ -521,7 +532,7 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 @option("model", description="The model to use")
 @option("leak_env", description="If set to true, leaks the env vars from the host system into the Codex container")
 @option("allow_create_working_dir", description="If set to true, it will create the working dir if it does not exist")
-@option("backend", choices=["codex", "claude"], description="Whether to use codex-headless or claude code as the underlying tool")
+@option("backend", choices=["codex", "claude", "gemini"], description="Whether to use codex-headless or claude code as the underlying tool")
 @log_command_usage
 async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, leak_env: bool = False, allow_create_working_dir: bool = True, backend: str = ToolBackend.CODEX_HEADLESS):
     """Registers a unique spawn ID that can be used for future prompts."""
@@ -568,14 +579,14 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str
             f"❌ leak_env=True has been configured as disallowed."
         )
         return
-    if backend not in (ToolBackend.CODEX_HEADLESS, ToolBackend.CLAUDE_CODE):
+    if backend not in (ToolBackend.CODEX_HEADLESS, ToolBackend.CLAUDE_CODE, ToolBackend.GEMINI_CLI):
         await ctx.respond(
             f"❌ Unknown backend {backend}."
         )
         return
-    if backend == ToolBackend.CLAUDE_CODE and NO_DOCKER:
+    if backend != ToolBackend.CODEX_HEADLESS and NO_DOCKER:
         await ctx.respond(
-            f"❌ Claude code backend is only supported when running in docker mode, which this bot is not."
+            f"❌ In NO_DOCKER mode, only the codex backend is supported."
         )
         return
     session_id = get_random_id()
@@ -749,8 +760,12 @@ def format_command(msg: str) -> str:
     return f'`{msg}`'
 
 
-def format_command_output(msg: str) -> str:
+def format_code_block(msg: str) -> str:
     return f'```\n{msg}\n```'
+
+
+def format_command_output(msg: str) -> str:
+    return format_code_block(msg)
 
 
 def rfind_nth(haystack: str, needle: str, nth: int) -> int:
@@ -764,49 +779,90 @@ def rfind_nth(haystack: str, needle: str, nth: int) -> int:
     return idx
 
 
-def send_codex_notification(worker_entry: dict, msg: str, reference=None):
+def send_codex_notification(worker_entry: dict, msg: str, backend: str, message_backlog: list[str], reference=None):
     action = ''
     messages = [msg]
+    append_to_message_backlog = False
     try:
         content = json.loads(msg)
-        if content.get("role", "unknown") == "user":
-            # raise RuntimeError("Unexpected message from role '" + content['role'] + "'")
-            return
-        if "type" not in content:
-            raise RuntimeError("Missing attribute 'type'")
-        content_ty = content["type"]
-        if content_ty == "message":
-            assert 'content' in content
-            messages = [format_response(c['text']) for c in content['content']]
-            action = ' responded'
-        elif content_ty == "reasoning":
-            assert 'summary' in content
-            messages = [format_thought(c['text']) for c in content['summary']]
-            action = ' thought'
-        elif content_ty == "local_shell_call":
-            assert 'action' in content and 'command' in content['action']
-            messages = [format_command(' '.join(content['action']['command']))]
-            action = ' executed'
-        elif content_ty == "local_shell_call_output":
-            assert 'output' in content
-            out = content['output']
-            try:
-                out = out.encode('utf-8').decode('unicode_escape')
-                # You can't properly load `out`. It should be json, but it is not escaped, so we have to
-                # hackily extract the content of the 'output' field.
-                start = out.find(':') + 2
-                end = rfind_nth(out, ',', 2) - 1
-                out_inner = out[start:end]
-            except Exception:
-                messages = [out]
-            else:
+        if backend == ToolBackend.GEMINI_CLI:
+            role = content["candidates"][0]["content"]["role"]
+        else:
+            role = content.get("role", "unknown")
+        if backend == ToolBackend.GEMINI_CLI:
+            resp = content["candidates"][0]["content"]["parts"][0]
+            content_ty = "message"
+            if resp.get("thought", False):
+                content_ty = "reasoning"
+            elif resp.get("functionCall"):
+                # TODO this is a bit hacky, because this mapping of gemini cli to codex cli actions is not quite 1 to 1
+                content_ty = "local_shell_call"
+            elif resp.get("functionResponse"):
+                content_ty = "local_shell_call_output"
+
+            if content_ty != "message" and message_backlog:
+                action = ' responded'
+                send_notification(worker_entry, ''.join(message_backlog), reference=reference, action=action)
+                message_backlog.clear()
+            elif content_ty == "message":
+                append_to_message_backlog = True
+
+            if content_ty == "message":
+                messages = [format_response(resp['text'])]
+                action = ' responded'
+            elif content_ty == "reasoning":
+                messages = [format_thought(resp['text'])]
+                action = ' thought'
+            elif content_ty == "local_shell_call":
+                messages = [format_code_block(json.dumps(resp["functionCall"], indent=2))]
+                action = ' executed'
+            elif content_ty == "local_shell_call_output":
+                out_inner = resp["response"]['output']
                 messages = [format_command_output(out_inner)]
-            action = ' got result'
+                action = ' got result'
+        else:
+            # This must be in the codex cli branch because 1. gemini cli does not print the user query and 2. functionResponse objects are role 'user' in gemini cli
+            if role == "user":
+                return
+            # TODO handle claude code properly
+            if "type" not in content:
+                raise RuntimeError("Missing attribute 'type'")
+            content_ty = content["type"]
+            if content_ty == "message":
+                assert 'content' in content
+                messages = [format_response(c['text']) for c in content['content']]
+                action = ' responded'
+            elif content_ty == "reasoning":
+                assert 'summary' in content
+                messages = [format_thought(c['text']) for c in content['summary']]
+                action = ' thought'
+            elif content_ty == "local_shell_call":
+                assert 'action' in content and 'command' in content['action']
+                messages = [format_command(' '.join(content['action']['command']))]
+                action = ' executed'
+            elif content_ty == "local_shell_call_output":
+                assert 'output' in content
+                out = content['output']
+                try:
+                    out = out.encode('utf-8').decode('unicode_escape')
+                    # You can't properly load `out`. It should be json, but it is not escaped, so we have to
+                    # hackily extract the content of the 'output' field.
+                    start = out.find(':') + 2
+                    end = rfind_nth(out, ',', 2) - 1
+                    out_inner = out[start:end]
+                except Exception:
+                    messages = [out]
+                else:
+                    messages = [format_command_output(out_inner)]
+                action = ' got result'
     except Exception:
         log(traceback.format_exc())
 
-    for m in messages:
-        send_notification(worker_entry, m, reference=reference, action=action)
+    if append_to_message_backlog:
+        message_backlog.extend(messages)
+    else:
+        for m in messages:
+            send_notification(worker_entry, m, reference=reference, action=action)
 
 
 def close_unterminated_code_blocks(s: str) -> str:
@@ -996,13 +1052,28 @@ async def on_message(message: discord.Message):
     assert proc.stdout is not None
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
 
+    # This allows configuring the bot so the responses will not reference the original user message. This way,
+    # the user will not be spammed with 'new message' notifications (and won't and up with 10s of unread messages).
+    if DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND:
+        reference = None
+    else:
+        reference = message
+
     async def reader():
         log(f"Spawning reader routine for agent {spawn_id}")
 
         notifications: list[dict] = []
+        message_backlog: list[str] = []  # used for buffering chunked gemini CLI responses and sending them as one message
         async for line in proc.stdout:
             line = line.strip().decode('utf-8')
             if not line:
+                if backend == ToolBackend.GEMINI_CLI and message_backlog:
+                    # Gemini CLI has a chunking mechanism where it sends it's responses in multiple chunks.
+                    # We buffer these chunks into a single message.
+                    # If we see a newline, we send and clear the backlog
+                    action = ' responded'
+                    send_notification(entry, ''.join(message_backlog), reference=reference, action=action)
+                    message_backlog.clear()
                 continue
             try:
                 line_json = json.loads(line)
@@ -1030,10 +1101,10 @@ async def on_message(message: discord.Message):
 
             log("New line from process:", line)
 
-            send_codex_notification(entry, line, reference=message)
+            send_codex_notification(entry, line, backend, message_backlog, reference=reference)
 
         # Send termination notification
-        send_notification(entry, f"AGENT **{spawn_id}** COMPLETED HIS MISSION!", critical=True, reference=message)
+        send_notification(entry, f"AGENT **{spawn_id}** COMPLETED HIS MISSION!", critical=True, reference=reference)
         log(f"Retiring reader routine for agent {spawn_id}")
 
         # Stop container

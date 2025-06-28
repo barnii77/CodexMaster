@@ -137,6 +137,30 @@ source .venv/bin/activate
 python bot.py
 ```
 
+## 8. Login to Gemini CLI (Optional)
+
+TODO show how to docker build, run the image, log in with curl in that container, and overwrite the image with the container by image-ifying the container.
+
+This section requires manually logging in to Gemini CLI by creating a new image from our `codex-cli-headless` container and logging in via oauth.
+Below are detailed instructions. They require a browser and 3 terminals.
+
+1. In terminal 3: `docker run --name codex-master-with-gemini-cli-login --cap-add=NET_ADMIN -it codex-cli-headless bash`
+2. In terminal 1 and 2 each: `docker exec -it codex-master-with-gemini-cli-login bash`
+3. In terminal 1: `/app/third_party/gemini-cli/bundle/gemini.js --debug`. Select the default colorscheme and press enter.
+4. You will be prompted to select an auth method. Choose `Login with Google`.
+5. An oauth link will be printed above a UI element with a spinner. It should be a long link. Open it in your browser.
+6. The browser will be redirected to localhost, and will say `ERR_CONNECTION_REFUSED`.
+7. Open devtools and go to the network tab.
+8. Reload the page so the request is sent again.
+9. A request will show up in the network tab. Right click on it, select `Copy` and choose `Copy as cURL (bash)`.
+10. In terminal 2: paste in this command you just copied and run it.
+11. In terminal 1: you should now be authenticated and be prompted to ask gemini something. Type `/quit` and exit Gemini CLI.
+12. In terminal 1 and 2 each: `exit`.
+13. In terminal 1: `docker stop codex-master-with-gemini-cli-login`
+14. In terminal 1 (now outside the container): `docker commit --author="me <me@example.com>" --message="set up gemini cli with google login" codex-master-with-gemini-cli-login codex-cli-headless:latest`
+
+You are now logged in to Gemini CLI with your Google account.
+
 ---
 
 *For more information on commands and usage, see [COMMANDS.md](COMMANDS.md).* 

@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     openssh-client \
+    xdg-utils \
     # --------- Build & language tooling ------------- \
     build-essential \
     git \

@@ -23,38 +23,40 @@ All commands below are invoked as Discord application (slash) commands. Only use
 ### `/spawn`
 **Description:** Registers a unique spawn ID that can be used for future prompts.
 
-| Option      | Type    | Description                                                            | Default           |
-|-------------|---------|------------------------------------------------------------------------|-------------------|
-| spawn_id    | string  | The ID under which you will reference the Codex Instance (alphanumeric, max 64 chars) | _required_        |
-| working_dir | string  | The working directory for the agent to operate in (must exist)         | _required_        |
-| provider    | string  | The provider to use (must be one of `ALLOWED_PROVIDERS`)                | openai            |
-| model       | string  | The model to use                                                       | codex-mini-latest |
-| leak_env    | boolean | Leak host environment variables into the container if allowed          | false             |
+| Option                   | Type    | Description                                                            | Default           |
+|--------------------------|---------|------------------------------------------------------------------------|-------------------|
+| spawn_id                 | string  | The ID under which you will reference the Codex Instance (alphanumeric, max 64 chars) | _required_        |
+| working_dir              | string  | The working directory for the agent to operate in                      | _required_        |
+| provider                 | string  | The provider to use (must be one of `ALLOWED_PROVIDERS`)                | openai            |
+| model                    | string  | The model to use                                                       | codex-mini-latest |
+| leak_env                 | boolean | Leak host environment variables into the container if allowed          | false             |
+| allow_create_working_dir | boolean | If set to true, it will create the working dir if it does not exist      | true              |
+| backend                  | string  | Whether to use codex-headless, claude code or gemini cli as the underlying tool | codex-headless    |
 
 ### `/set_provider`
 **Description:** Change the provider for an existing Agent.
 
-| Option   | Type   | Description         |
-|----------|--------|---------------------|
-| spawn_id | string | The ID of the Agent |
-| provider | string | The Provider to use |
+| Option   | Type   | Description         | Default |
+|----------|--------|---------------------|---------|
+| spawn_id | string | The ID of the Agent | _required_ |
+| provider | string | The Provider to use | openai  |
 
 ### `/set_model`
 **Description:** Change the model for an existing Agent.
 
-| Option   | Type   | Description        |
-|----------|--------|--------------------|
-| spawn_id | string | The ID of the Agent |
-| model    | string | The model to use    |
+| Option   | Type   | Description        | Default           |
+|----------|--------|--------------------|-------------------|
+| spawn_id | string | The ID of the Agent | _required_        |
+| model    | string | The model to use    | codex-mini-latest |
 
 ### `/kill`
 **Description:** Kill active processes for a spawn ID.
 
-| Option            | Type    | Description                                                      |
-|-------------------|---------|------------------------------------------------------------------|
-| spawn_id          | string  | The spawn ID to kill processes for                              |
-| delete            | boolean | Delete the agent fully (including Docker container)             |
-| revert_chat_state | boolean | Revert chat state to before your last message if process was killed |
+| Option            | Type    | Description                                                      | Default |
+|-------------------|---------|------------------------------------------------------------------|---------|
+| spawn_id          | string  | The spawn ID to kill processes for                              | _required_ |
+| delete            | boolean | Delete the agent fully (including Docker container)             | false   |
+| revert_chat_state | boolean | Revert chat state to before your last message if process was killed | true    |
 
 ### `/delete_all_agents`
 **Description:** Kill all agents and delete the `spawns.json` file.

@@ -139,8 +139,6 @@ python bot.py
 
 ## 8. Login to Gemini CLI (Optional)
 
-TODO show how to docker build, run the image, log in with curl in that container, and overwrite the image with the container by image-ifying the container.
-
 This section requires manually logging in to Gemini CLI by creating a new image from our `codex-cli-headless` container and logging in via oauth.
 Below are detailed instructions. They require a browser and 3 terminals.
 

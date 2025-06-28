@@ -479,8 +479,7 @@ async def launch_agent(
             # "--update-session-file", "false",
             "--full-auto",
             "--provider", provider,
-            "-m", model,
-        ]
+        ] + (["--model", model] if model != "default" else [])
     elif backend == ToolBackend.CLAUDE_CODE:
         args = optional_docker_prefix + [
             "/usr/local/bin/claude",
@@ -488,9 +487,8 @@ async def launch_agent(
             "--dangerously-skip-permissions",
             "--verbose",
             "--output-format", "stream-json",
-            "--model", model,
             "--continue",
-        ]
+        ] + (["--model", model] if model != "default" else [])
     elif backend == ToolBackend.GEMINI_CLI:
         sess_fp = os.path.expanduser("~/.gemini_session.json")
         args = optional_docker_prefix + [
@@ -499,7 +497,7 @@ async def launch_agent(
             "--session", sess_fp,
             "--json",
             "--yolo",
-        ]
+        ] + (["--model", model] if model != "default" else [])
     else:
         raise RuntimeError("unreachable")
 
@@ -534,7 +532,7 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 @option("allow_create_working_dir", description="If set to true, it will create the working dir if it does not exist")
 @option("backend", choices=["codex", "claude", "gemini"], description="Whether to use codex-headless or claude code as the underlying tool")
 @log_command_usage
-async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = DEFAULT_MODEL, leak_env: bool = False, allow_create_working_dir: bool = True, backend: str = ToolBackend.CODEX_HEADLESS):
+async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = "default", leak_env: bool = False, allow_create_working_dir: bool = True, backend: str = ToolBackend.CODEX_HEADLESS):
     """Registers a unique spawn ID that can be used for future prompts."""
     if spawn_id in spawns:
         await ctx.respond(
@@ -786,7 +784,10 @@ def send_codex_notification(worker_entry: dict, msg: str, backend: str, message_
     try:
         content = json.loads(msg)
         if backend == ToolBackend.GEMINI_CLI:
-            role = content["candidates"][0]["content"]["role"]
+            if content.get("callId"):
+                role = "user"
+            else:
+                role = content["candidates"][0]["content"]["role"]
         else:
             role = content.get("role", "unknown")
         if backend == ToolBackend.GEMINI_CLI:

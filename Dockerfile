@@ -62,6 +62,11 @@ RUN mkdir -p /app
 RUN python3 -m venv /app/.venv
 RUN bash -c "source /app/.venv/bin/activate && pip install pydantic_extra_types==2.10.3 pydantic==2.10.6 mcp==1.3.0 tzdata==2025.1 openai==1.66.2 typer==0.15.2"
 
+# Copy and build the gemini-cli part
+COPY ./third_party/gemini-cli /app/third_party/gemini-cli
+RUN chmod +x /app/third_party/gemini-cli/bundle.sh
+RUN bash -lc "cd /app/third_party/gemini-cli && ./bundle.sh && cd -"
+
 # Copy the dist folder for codex-headless
 COPY ./third_party/codex-headless/dist/ /app/third_party/codex-headless/dist/
 RUN chmod +x /app/third_party/codex-headless/dist/bin/codex-linux-sandbox-x64

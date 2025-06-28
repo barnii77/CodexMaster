@@ -790,14 +790,17 @@ def send_codex_notification(worker_entry: dict, msg: str, backend: str, message_
         else:
             role = content.get("role", "unknown")
         if backend == ToolBackend.GEMINI_CLI:
-            resp = content["candidates"][0]["content"]["parts"][0]
+            if "callId" in content:
+                resp = content["responseParts"]["functionResponse"]
+            else:
+                resp = content["candidates"][0]["content"]["parts"][0]
             content_ty = "message"
             if resp.get("thought", False):
                 content_ty = "reasoning"
             elif resp.get("functionCall"):
                 # TODO this is a bit hacky, because this mapping of gemini cli to codex cli actions is not quite 1 to 1
                 content_ty = "local_shell_call"
-            elif resp.get("functionResponse"):
+            elif content.get("callId"):
                 content_ty = "local_shell_call_output"
 
             if content_ty != "message" and message_backlog:
@@ -817,7 +820,7 @@ def send_codex_notification(worker_entry: dict, msg: str, backend: str, message_
                 messages = [format_code_block(json.dumps(resp["functionCall"], indent=2))]
                 action = ' executed'
             elif content_ty == "local_shell_call_output":
-                out_inner = resp["response"]['output']
+                out_inner = resp["response"]["output"]
                 messages = [format_command_output(out_inner)]
                 action = ' got result'
         else:

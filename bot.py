@@ -1002,6 +1002,8 @@ async def on_message(message: discord.Message):
         notifications: list[dict] = []
         async for line in proc.stdout:
             line = line.strip().decode('utf-8')
+            if not line:
+                continue
             try:
                 line_json = json.loads(line)
             except json.JSONDecodeError:

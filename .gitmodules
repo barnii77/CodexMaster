@@ -4,3 +4,6 @@
 [submodule "third_party/openai-websearch-mcp"]
 	path = third_party/openai-websearch-mcp
 	url = https://github.com/ConechoAI/openai-websearch-mcp
+[submodule "third_party/gemini-cli"]
+	path = third_party/gemini-cli
+	url = https://github.com/barnii77/gemini-cli

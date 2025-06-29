@@ -1038,7 +1038,7 @@ async def on_message(message: discord.Message):
         prompt += "\n\nUploaded attachments:"
         for attachment in message.attachments:
             safe_filename = secure_filename(attachment.filename)
-            filepath = safe_join("~/.codex/uploads", safe_filename)
+            filepath = safe_join(os.path.expanduser("~/.codex/uploads"), safe_filename)
             prompt += f"\n- {filepath}"
 
     # Start the agent

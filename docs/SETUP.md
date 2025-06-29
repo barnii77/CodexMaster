@@ -142,7 +142,7 @@ python bot.py
 This section requires manually logging in to Gemini CLI by creating a new image from our `codex-cli-headless` container and logging in via oauth.
 Below are detailed instructions. They require a browser and 3 terminals.
 
-1. In terminal 3: `docker run --name codex-master-with-gemini-cli-login --cap-add=NET_ADMIN -it codex-cli-headless bash`
+1. In terminal 3: `docker run --name codex-master-with-gemini-cli-login -e CODEX_HOME=$HOME -e CODEX_USER=$USER --cap-add=NET_ADMIN -it codex-cli-headless bash`
 2. In terminal 1 and 2 each: `docker exec -it codex-master-with-gemini-cli-login bash`
 3. In terminal 1: `/app/third_party/gemini-cli/bundle/gemini.js --debug`. Select the default colorscheme and press enter.
 4. You will be prompted to select an auth method. Choose `Login with Google`.

@@ -472,7 +472,7 @@ async def launch_agent(
     log(f"Launching {backend}...")
     if backend == ToolBackend.CODEX_HEADLESS:
         args = optional_docker_prefix + [
-            "node",
+            "node", "--enable-source-maps",
             cli_script_abspath,
             "-q", prompt,
             "--session-id", session_id,

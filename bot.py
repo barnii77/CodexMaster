@@ -55,7 +55,10 @@ ALLOW_LEAK_ENV = bool(os.getenv("ALLOW_LEAK_ENV", False))
 # performance settings
 MAX_CPU_USAGE = float(os.getenv("MAX_CPU_USAGE", 1.0))
 MAX_RAM_USAGE_GB = float(os.getenv("MAX_RAM_USAGE_GB", 4.0))
+
 DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = bool(os.getenv("DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND", False))
+DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK = bool(os.getenv("DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK", False))
+DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT = bool(os.getenv("DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT", False))
 
 with open("session_json_template.json") as f:
     session_json_template = json.load(f)
@@ -906,11 +909,11 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
     while msg:
         msg_piece = close_unterminated_code_blocks(msg[:DISCORD_CHARACTER_LIMIT]) + (
             f"\n\n... ({len(msg[DISCORD_CHARACTER_LIMIT:].splitlines())} lines left)"
-            if len(msg) >= DISCORD_CHARACTER_LIMIT
+            if DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT and len(msg) >= DISCORD_CHARACTER_LIMIT
             else ""
         )
         msg = msg[DISCORD_CHARACTER_LIMIT:]
-        if not is_first_iter:
+        if DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK and not is_first_iter:
             # Put the bulk of long messages into code blocks
             msg_piece = f"```\n{msg_piece}\n```"
 

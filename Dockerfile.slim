@@ -81,12 +81,6 @@ RUN chmod +x /usr/local/bin/claude
 COPY ./tools/web_search.py /app/tools/web_search.py
 RUN chmod +x /app/tools/web_search.py
 
-# Create symlink in /usr/local/bin for all tools
-#RUN ln -s /app/tools/web_search.py /usr/local/bin/web_search
-
-# Copy the server.py file from openai-websearch-mcp
-#COPY ./third_party/openai-websearch-mcp/server.py /app/third_party/openai-websearch-mcp/server.py
-
 # Copy the entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

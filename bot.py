@@ -5,6 +5,7 @@ import asyncio
 import sys
 import traceback
 import datetime
+import time
 import uuid
 import shutil
 import getpass
@@ -12,6 +13,7 @@ import functools
 import string
 import aiohttp
 import aiofiles
+import threading
 
 import discord
 from discord import option
@@ -43,22 +45,22 @@ DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest").strip()
 assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
 
-NO_DOCKER = bool(int(os.getenv("NO_DOCKER", 0)))
+NO_DOCKER = int(int(os.getenv("NO_DOCKER", 0)))
 CODEX_DOCKER_IMAGE_NAME = os.getenv("CODEX_DOCKER_IMAGE_NAME")
 assert NO_DOCKER or CODEX_DOCKER_IMAGE_NAME is not None
 
 CODEX_ENV_FILE = os.getenv("CODEX_ENV_FILE")
 assert CODEX_ENV_FILE is None or os.path.exists(CODEX_ENV_FILE)
 
-ALLOW_LEAK_ENV = bool(os.getenv("ALLOW_LEAK_ENV", False))
+ALLOW_LEAK_ENV = int(os.getenv("ALLOW_LEAK_ENV", False))
 
 # performance settings
 MAX_CPU_USAGE = float(os.getenv("MAX_CPU_USAGE", 1.0))
 MAX_RAM_USAGE_GB = float(os.getenv("MAX_RAM_USAGE_GB", 4.0))
 
-DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = bool(os.getenv("DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND", False))
-DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK = bool(os.getenv("DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK", False))
-DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT = bool(os.getenv("DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT", False))
+DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = int(os.getenv("DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND", False))
+DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK = int(os.getenv("DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK", False))
+DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT = int(os.getenv("DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT", False))
 
 with open("session_json_template.json") as f:
     session_json_template = json.load(f)
@@ -91,7 +93,8 @@ if not os.path.exists(CODEX_MASTER_AGENTS_MD_PATH):
 CODEX_MASTER_DIR = os.path.join(DOT_CODEX_DIR, "codex-master")
 os.makedirs(CODEX_MASTER_DIR, exist_ok=True)
 
-CLEAN_CODEX_MASTER_DIR = os.getenv("CLEAN_CODEX_MASTER_DIR", 1)
+CLEAN_CODEX_MASTER_DIR = int(os.getenv("CLEAN_CODEX_MASTER_DIR", 1))
+CLEAN_ALL_BACKUPS_CRONJOB_PERIOD = int(os.getenv("CLEAN_ALL_BACKUPS_CRONJOB_PERIOD", -1))
 
 
 class ToolBackend:
@@ -137,6 +140,17 @@ def clean_master_dir():
         if not any(sess_id in agent_dir for sess_id in live_session_ids):
             log(f"Removing dead agent session dir {agent_dir}")
             shutil.rmtree(agent_dir)
+
+def clean_backups():
+    # dirty but easy way to run utility script
+    import delete_all_backup_json_files
+    delete_all_backup_json_files.main(DOT_CODEX_DIR)
+
+
+def clean_backups_cronjob():
+    while True:
+        clean_backups()
+        time.sleep(CLEAN_ALL_BACKUPS_CRONJOB_PERIOD)
 
 
 def save_spawns():
@@ -1147,5 +1161,7 @@ if __name__ == "__main__":
     if not token:
         log("Error: DISCORD_BOT_TOKEN environment variable not set.")
         sys.exit(1)
+    if CLEAN_ALL_BACKUPS_CRONJOB_PERIOD > 0:
+        threading.Thread(clean_backups_cronjob).start()
     bot.run(token)
 

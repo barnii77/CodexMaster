@@ -3,3 +3,4 @@ codex.env
 .venv
 spawns.json
 TODO.md
+__pycache__

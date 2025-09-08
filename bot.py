@@ -144,7 +144,7 @@ def clean_master_dir():
 def clean_backups():
     # dirty but easy way to run utility script
     import delete_all_backup_json_files
-    delete_all_backup_json_files.main(DOT_CODEX_DIR)
+    delete_all_backup_json_files.main()
 
 
 def clean_backups_cronjob():
@@ -1162,6 +1162,6 @@ if __name__ == "__main__":
         log("Error: DISCORD_BOT_TOKEN environment variable not set.")
         sys.exit(1)
     if CLEAN_ALL_BACKUPS_CRONJOB_PERIOD > 0:
-        threading.Thread(clean_backups_cronjob).start()
+        threading.Thread(target=clean_backups_cronjob).start()
     bot.run(token)
 

@@ -40,8 +40,11 @@ assert ':' not in DEFAULT_WORKING_DIR
 DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest").strip()
 DEFAULT_AGENT_VERBOSITY = os.getenv("DEFAULT_AGENT_VERBOSITY", "answers").strip().lower()
+VALID_REASONING_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
+DEFAULT_REASONING_EFFORT = os.getenv("DEFAULT_REASONING_EFFORT", "default").strip().lower()
 assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
 assert DEFAULT_AGENT_VERBOSITY in ("answers", "verbose")
+assert DEFAULT_REASONING_EFFORT in VALID_REASONING_EFFORTS
 
 ALLOW_DOCKER_EXECUTION = int(int(os.getenv("ALLOW_DOCKER_EXECUTION", 1)))
 ALLOW_HOST_EXECUTION = int(int(os.getenv("ALLOW_HOST_EXECUTION", 0)))
@@ -77,6 +80,15 @@ bot = commands.Bot(command_prefix="", intents=intents)
 spawns: dict[str, dict] = {}
 
 
+def normalize_agent_reasoning_effort(reasoning_effort: Optional[str]) -> str:
+    if reasoning_effort is None:
+        return DEFAULT_REASONING_EFFORT
+    reasoning_effort = str(reasoning_effort).strip().lower()
+    if reasoning_effort not in VALID_REASONING_EFFORTS:
+        return DEFAULT_REASONING_EFFORT
+    return reasoning_effort
+
+
 def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
     if not isinstance(entry, dict):
         raise ValueError("spawn entry is not an object")
@@ -89,6 +101,7 @@ def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
         "working_dir",
         "execution_mode",
         "verbosity",
+        "reasoning_effort",
         "leak_env",
         "channel",
         "user",
@@ -112,10 +125,17 @@ def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
         raise ValueError("execution_mode must be 'docker' or 'host'")
     if not isinstance(entry["verbosity"], str):
         raise ValueError("verbosity must be a string")
+    if not isinstance(entry["reasoning_effort"], str):
+        raise ValueError("reasoning_effort must be a string")
 
     normalized_verbosity = str(entry["verbosity"]).strip().lower()
     if normalized_verbosity not in ("answers", "verbose"):
         raise ValueError("verbosity must be 'answers' or 'verbose'")
+    normalized_reasoning_effort = str(entry["reasoning_effort"]).strip().lower()
+    if normalized_reasoning_effort not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            "reasoning_effort must be one of " + ", ".join(VALID_REASONING_EFFORTS)
+        )
 
     codex_session_id = entry["codex_session_id"]
     if codex_session_id is not None and not isinstance(codex_session_id, str):
@@ -126,6 +146,7 @@ def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
     # Persisted files should not contain live process handles; ensure we start empty.
     entry["processes"] = []
     entry["verbosity"] = normalized_verbosity
+    entry["reasoning_effort"] = normalized_reasoning_effort
     entry["provider"] = entry["provider"].strip()
     entry["model"] = entry["model"].strip()
     entry["leak_env"] = bool(entry["leak_env"])
@@ -472,6 +493,7 @@ async def launch_agent(
     codex_session_id: Optional[str],
     provider: str,
     model: str,
+    reasoning_effort: str,
     working_dir: str,
     leak_env: bool = False,
     execution_mode: str = DEFAULT_EXECUTION_MODE,
@@ -513,6 +535,9 @@ async def launch_agent(
         codex_options.extend(["-c", f'model_provider="{provider}"'])
     if model != "default":
         codex_options.extend(["-m", model])
+    reasoning_effort = normalize_agent_reasoning_effort(reasoning_effort)
+    if reasoning_effort != "default":
+        codex_options.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
     if codex_session_id:
         args = optional_docker_prefix + [
@@ -561,6 +586,7 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 @option("model", description="The model to use")
 @option("execution_mode", choices=["docker", "host"], description="Run Codex in Docker or directly on the host")
 @option("verbosity", choices=["answers", "verbose"], description="Only answers+token usage, or include tool calls and thoughts")
+@option("reasoning_effort", choices=list(VALID_REASONING_EFFORTS), description="Reasoning/thinking effort override for the agent")
 @option("leak_env", description="If set to true, leaks host environment variables into the Codex runtime")
 @option("allow_create_working_dir", description="If set to true, it will create the working dir if it does not exist")
 @log_command_usage
@@ -572,6 +598,7 @@ async def spawn(
     model: str = "default",
     execution_mode: str = DEFAULT_EXECUTION_MODE,
     verbosity: str = DEFAULT_AGENT_VERBOSITY,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     leak_env: bool = False,
     allow_create_working_dir: bool = True,
 ):
@@ -630,6 +657,7 @@ async def spawn(
         await ctx.respond("❌ Host execution has been disabled by configuration.")
         return
     verbosity = normalize_agent_verbosity(verbosity)
+    reasoning_effort = normalize_agent_reasoning_effort(reasoning_effort)
 
     if is_docker_execution_mode(execution_mode):
         await create_agent_docker_container(spawn_id, working_dir, leak_env)
@@ -638,6 +666,7 @@ async def spawn(
         "codex_session_id": None,
         "provider": provider,
         "model": model.strip(),
+        "reasoning_effort": reasoning_effort,
         "working_dir": working_dir,
         "execution_mode": execution_mode,
         "verbosity": verbosity,
@@ -774,7 +803,8 @@ async def list_spawns(ctx: discord.ApplicationContext):
         execution_mode = entry["execution_mode"]
         verbosity = entry["verbosity"]
         if procs:
-            lines.append(f"**{sid}** ({execution_mode}, {verbosity}):")
+            reasoning_effort = entry["reasoning_effort"]
+            lines.append(f"**{sid}** ({execution_mode}, {verbosity}, effort={reasoning_effort}):")
             for item in procs:
                 p = item["proc"]
                 delta = now - item["start_time"]
@@ -789,7 +819,8 @@ async def list_spawns(ctx: discord.ApplicationContext):
                     elapsed = f"{s}s"
                 lines.append(f" • PID {p.pid} – running for {elapsed}")
         else:
-            lines.append(f"**{sid}** ({execution_mode}, {verbosity}): no active processes")
+            reasoning_effort = entry["reasoning_effort"]
+            lines.append(f"**{sid}** ({execution_mode}, {verbosity}, effort={reasoning_effort}): no active processes")
     await ctx.respond("\n".join(lines))
 
 
@@ -1102,6 +1133,7 @@ async def on_message(message: discord.Message):
     codex_session_id = entry["codex_session_id"]
     provider = entry["provider"]
     model = entry["model"]
+    reasoning_effort = entry["reasoning_effort"]
     working_dir = entry["working_dir"]
     leak_env = entry["leak_env"]
     execution_mode = entry["execution_mode"]
@@ -1137,7 +1169,17 @@ async def on_message(message: discord.Message):
 
     # Start the agent
     prompt = build_codex_prompt(prompt)
-    proc = await launch_agent(spawn_id, prompt, codex_session_id, provider, model, working_dir, leak_env, execution_mode)
+    proc = await launch_agent(
+        spawn_id,
+        prompt,
+        codex_session_id,
+        provider,
+        model,
+        reasoning_effort,
+        working_dir,
+        leak_env,
+        execution_mode,
+    )
     await message.channel.send(f"✅ AGENT **{spawn_id}** DEPLOYED...", reference=message)
 
     assert proc.stdout is not None

@@ -526,12 +526,11 @@ async def launch_agent(
 
     codex_options = [
         "--json",
-        "--skip-git-repo-check",
-        "--full-auto",
+        "--yolo",
     ]
     if provider == "oss":
         codex_options.append("--oss")
-    else:
+    elif provider != "openai":
         codex_options.extend(["-c", f'model_provider="{provider}"'])
     if model != "default":
         codex_options.extend(["-m", model])

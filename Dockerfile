@@ -63,11 +63,6 @@ RUN mkdir -p /app
 RUN python3 -m venv /app/.venv
 RUN bash -c "source /app/.venv/bin/activate && pip install pydantic_extra_types==2.10.3 pydantic==2.10.6 mcp==1.3.0 tzdata==2025.1 openai==1.66.2 typer==0.15.2"
 
-# Copy custom tools for Codex (python scripts invoked through terminal).
-# No extension so it can be called like `web_search -q "query"`
-COPY ./tools/web_search.py /app/tools/web_search.py
-RUN chmod +x /app/tools/web_search.py
-
 # Copy the entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

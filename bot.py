@@ -38,7 +38,7 @@ ALLOWED_PROVIDERS = list(map(str.strip, os.getenv("ALLOWED_PROVIDERS", "openai")
 DEFAULT_WORKING_DIR = os.path.expanduser(os.getenv("DEFAULT_WORKING_DIR", os.getcwd()))
 assert ':' not in DEFAULT_WORKING_DIR
 DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai").strip()
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest").strip()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5.3-codex").strip()
 DEFAULT_AGENT_VERBOSITY = os.getenv("DEFAULT_AGENT_VERBOSITY", "answers").strip().lower()
 VALID_REASONING_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_REASONING_EFFORT = os.getenv("DEFAULT_REASONING_EFFORT", "default").strip().lower()

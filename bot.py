@@ -5,15 +5,12 @@ import asyncio
 import sys
 import traceback
 import datetime
-import time
-import uuid
-import shutil
 import getpass
 import functools
 import string
+import glob
 import aiohttp
 import aiofiles
-import threading
 
 import discord
 from discord import option
@@ -37,19 +34,29 @@ ALLOWED_USER_IDS = {int(u) for u in allowed_ids_env.split(",") if u.strip()}
 
 DISCORD_CHARACTER_LIMIT = 1950
 
-BOT_WORKING_DIR = os.getcwd()
 ALLOWED_PROVIDERS = list(map(str.strip, os.getenv("ALLOWED_PROVIDERS", "openai").split(',')))
 DEFAULT_WORKING_DIR = os.path.expanduser(os.getenv("DEFAULT_WORKING_DIR", os.getcwd()))
 assert ':' not in DEFAULT_WORKING_DIR
 DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "openai").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "codex-mini-latest").strip()
+DEFAULT_AGENT_VERBOSITY = os.getenv("DEFAULT_AGENT_VERBOSITY", "answers").strip().lower()
 assert DEFAULT_PROVIDER in ALLOWED_PROVIDERS
+assert DEFAULT_AGENT_VERBOSITY in ("answers", "verbose")
 
-NO_DOCKER = int(int(os.getenv("NO_DOCKER", 0)))
+ALLOW_DOCKER_EXECUTION = int(int(os.getenv("ALLOW_DOCKER_EXECUTION", 1)))
+ALLOW_HOST_EXECUTION = int(int(os.getenv("ALLOW_HOST_EXECUTION", 0)))
+DEFAULT_EXECUTION_MODE = os.getenv("DEFAULT_EXECUTION_MODE", "docker").strip()
+assert ALLOW_DOCKER_EXECUTION or ALLOW_HOST_EXECUTION
+assert DEFAULT_EXECUTION_MODE in ("docker", "host")
+if DEFAULT_EXECUTION_MODE == "docker":
+    assert ALLOW_DOCKER_EXECUTION
+else:
+    assert ALLOW_HOST_EXECUTION
+
 CODEX_DOCKER_IMAGE_NAME = os.getenv("CODEX_DOCKER_IMAGE_NAME")
-assert NO_DOCKER or CODEX_DOCKER_IMAGE_NAME is not None
+assert (not ALLOW_DOCKER_EXECUTION) or CODEX_DOCKER_IMAGE_NAME is not None
 
-CODEX_ENV_FILE = os.getenv("CODEX_ENV_FILE")
+CODEX_ENV_FILE = (os.getenv("CODEX_ENV_FILE") or "").strip() or None
 assert CODEX_ENV_FILE is None or os.path.exists(CODEX_ENV_FILE)
 
 ALLOW_LEAK_ENV = int(os.getenv("ALLOW_LEAK_ENV", False))
@@ -62,19 +69,89 @@ DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = int(os.getenv("DISCORD_RESPONSE_NO_
 DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK = int(os.getenv("DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK", False))
 DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT = int(os.getenv("DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT", False))
 
-with open("session_json_template.json") as f:
-    session_json_template = json.load(f)
-
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="", intents=intents)
 
 
 # Mapping of spawn IDs to channel, user, and active processes
 spawns: dict[str, dict] = {}
+
+
+def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
+    if not isinstance(entry, dict):
+        raise ValueError("spawn entry is not an object")
+
+    required_keys = {
+        "spawn_id",
+        "codex_session_id",
+        "provider",
+        "model",
+        "working_dir",
+        "execution_mode",
+        "verbosity",
+        "leak_env",
+        "channel",
+        "user",
+        "processes",
+    }
+    missing = sorted(required_keys - set(entry))
+    if missing:
+        raise ValueError(f"missing keys: {', '.join(missing)}")
+
+    if entry["spawn_id"] != spawn_id:
+        raise ValueError("spawn_id key mismatch")
+    if not isinstance(entry["provider"], str):
+        raise ValueError("provider must be a string")
+    if entry["provider"].strip() not in ALLOWED_PROVIDERS:
+        raise ValueError(f"provider '{entry['provider']}' not allowed")
+    if not isinstance(entry["model"], str):
+        raise ValueError("model must be a string")
+    if not isinstance(entry["working_dir"], str):
+        raise ValueError("working_dir must be a string")
+    if not isinstance(entry["execution_mode"], str) or entry["execution_mode"] not in ("docker", "host"):
+        raise ValueError("execution_mode must be 'docker' or 'host'")
+    if not isinstance(entry["verbosity"], str):
+        raise ValueError("verbosity must be a string")
+
+    normalized_verbosity = str(entry["verbosity"]).strip().lower()
+    if normalized_verbosity not in ("answers", "verbose"):
+        raise ValueError("verbosity must be 'answers' or 'verbose'")
+
+    codex_session_id = entry["codex_session_id"]
+    if codex_session_id is not None and not isinstance(codex_session_id, str):
+        raise ValueError("codex_session_id must be null or string")
+    if not isinstance(entry["processes"], list):
+        raise ValueError("processes must be a list")
+
+    # Persisted files should not contain live process handles; ensure we start empty.
+    entry["processes"] = []
+    entry["verbosity"] = normalized_verbosity
+    entry["provider"] = entry["provider"].strip()
+    entry["model"] = entry["model"].strip()
+    entry["leak_env"] = bool(entry["leak_env"])
+    return entry
+
+
 try:
     with open("spawns.json") as f:
-        spawns = json.load(f)
+        loaded_spawns = json.load(f)
+        if not isinstance(loaded_spawns, dict):
+            raise ValueError("spawns.json root must be an object")
+        invalid_spawn_ids = []
+        for spawn_id, entry in loaded_spawns.items():
+            try:
+                spawns[spawn_id] = normalize_persisted_spawn(spawn_id, entry)
+            except Exception as e:
+                invalid_spawn_ids.append((spawn_id, str(e)))
+        for spawn_id, reason in invalid_spawn_ids:
+            if LOG_LEVEL:
+                print(
+                    f"Dropping incompatible agent '{spawn_id}' from spawns.json: {reason}",
+                    file=sys.stderr,
+                )
 except json.JSONDecodeError:
+    spawns = {}
+except ValueError:
     spawns = {}
 except FileNotFoundError:
     pass
@@ -85,22 +162,8 @@ newly_killed_procs = []
 
 instructions = "You are Codex, a highly autonomous AI coding agent that lives in the terminal. You help users by completing tasks they assign you, e.g. writing, testing or debugging code or doing research for them."
 
-# Set up directory structure
 DOT_CODEX_DIR = os.path.expanduser("~/.codex")
-CODEX_MASTER_AGENTS_MD_PATH = os.path.join(DOT_CODEX_DIR, "CODEX_MASTER_AGENTS.md")
-if not os.path.exists(CODEX_MASTER_AGENTS_MD_PATH):
-    CODEX_MASTER_AGENTS_MD_PATH = None
-CODEX_MASTER_DIR = os.path.join(DOT_CODEX_DIR, "codex-master")
-os.makedirs(CODEX_MASTER_DIR, exist_ok=True)
-
-CLEAN_CODEX_MASTER_DIR = int(os.getenv("CLEAN_CODEX_MASTER_DIR", 1))
-CLEAN_ALL_BACKUPS_CRONJOB_PERIOD = int(os.getenv("CLEAN_ALL_BACKUPS_CRONJOB_PERIOD", -1))
-
-
-class ToolBackend:
-    CODEX_HEADLESS = "codex"
-    CLAUDE_CODE = "claude"
-    GEMINI_CLI = "gemini"
+os.makedirs(DOT_CODEX_DIR, exist_ok=True)
 
 
 def log(*args, **kwargs):
@@ -129,30 +192,6 @@ def notify_on_internal_error(func):
     return wrapper
 
 
-def clean_master_dir():
-    if NO_DOCKER or not CLEAN_CODEX_MASTER_DIR:
-        return
-    live_session_ids = []
-    for spawn in spawns.values():
-        live_session_ids.append(spawn['session_id'])
-    for agent_dir in os.listdir(CODEX_MASTER_DIR):
-        agent_dir = os.path.join(CODEX_MASTER_DIR, agent_dir)
-        if not any(sess_id in agent_dir for sess_id in live_session_ids):
-            log(f"Removing dead agent session dir {agent_dir}")
-            shutil.rmtree(agent_dir)
-
-def clean_backups():
-    # dirty but easy way to run utility script
-    import delete_all_backup_json_files
-    delete_all_backup_json_files.main()
-
-
-def clean_backups_cronjob():
-    while True:
-        clean_backups()
-        time.sleep(CLEAN_ALL_BACKUPS_CRONJOB_PERIOD)
-
-
 def save_spawns():
     log("Saving spawns")
     spawns_to_save = {}
@@ -172,8 +211,6 @@ def save_spawns():
 
     with open("spawns.json", "w") as f:
         json.dump(spawns_to_save, f)
-
-    clean_master_dir()
 
 
 @bot.event
@@ -213,93 +250,65 @@ async def hello(
     await ctx.respond(greeting)
 
 
-def get_random_id() -> str:
-    return str(uuid.uuid4())
+def find_codex_session_file_path(session_id: Optional[str]) -> Optional[str]:
+    if not session_id:
+        return None
+    pattern = os.path.join(DOT_CODEX_DIR, "sessions", "**", f"*{session_id}*.jsonl")
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        return None
+    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return matches[0]
 
 
-def get_session_file_path(session_id: str) -> str:
-    if NO_DOCKER:
-        return os.path.expanduser(f'~/.codex/sessions/rollout-date-elided-{session_id}.json')
-    return os.path.join(os.path.join(CODEX_MASTER_DIR, session_id), f'sessions/rollout-date-elided-{session_id}.json')
+def read_text_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-def repair_session_items(items: list[dict]) -> list[dict]:
-    """Remove messages that will be ignored or are invalid (e.g. local_shell_call's without corresponding outputs)."""
-    # Remove messages of unexpected type or with empty content
-    items = list(filter(
-        lambda item: (item.get('type') in ('message', 'reasoning', 'local_shell_call', 'local_shell_call_output')
-                      and (item.get('type'), item.get('summary')) != ('reasoning', [])),
-        items,
-    ))
-
-    # Record where what call_id's occur
-    call_id_occurences = {}
-    for item in items:
-        call_id = item.get('call_id')
-        if call_id is None:
-            continue
-        call_id_occurences.setdefault(call_id, []).append(item['type'])
-
-    # Identify illegal combinations of shell calls and outputs
-    illegal_call_ids = set()
-    for call_id, occurences in call_id_occurences.items():
-        # Only this specific pattern and order of shell call and output is allowed
-        if occurences != ["local_shell_call", "local_shell_call_output"]:
-            illegal_call_ids.add(call_id)
-
-    # Filter shell calls without corresponding outputs and vice versa
-    items = list(filter(lambda item: 'call_id' not in item or item['call_id'] not in illegal_call_ids, items))
-
-    return items
+def restore_codex_session_file(session_id: Optional[str], previous_content: Optional[str]) -> bool:
+    path = find_codex_session_file_path(session_id)
+    if previous_content is None:
+        if path and os.path.exists(path):
+            os.remove(path)
+            return True
+        return False
+    if path is None:
+        return False
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(previous_content)
+    return True
 
 
-def get_claude_json_path(session_id: str) -> str:
-    claude_json_dir = os.path.join(CODEX_MASTER_DIR, session_id)
-    os.makedirs(claude_json_dir, exist_ok=True)
-    claude_json_path = os.path.join(claude_json_dir, ".claude.json")
-    return claude_json_path
+def get_host_proc_env(leak_env: bool) -> Optional[dict[str, str]]:
+    if leak_env:
+        return None
+
+    passthrough_keys = [
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+    ]
+    env = {k: v for k in passthrough_keys if (v := os.environ.get(k)) is not None}
+    if CODEX_ENV_FILE is not None:
+        for k, v in dotenv_values(CODEX_ENV_FILE).items():
+            if v is not None:
+                env[k] = v
+    return env
 
 
-def write_session_file(session_id: str, items: list[dict], backend: str):
-    path = get_session_file_path(session_id)
-    try:
-        items = repair_session_items(items)
-    except Exception:
-        pass
-    content = deepcopy(session_json_template)
-    content['session']['id'] = session_id
-    timestamp = datetime.datetime.now().isoformat('T', 'milliseconds') + 'Z'
-    content['session']['timestamp'] = timestamp
-    content['session']['instructions'] = instructions
-    content['items'] = items
-    with open(path, 'w') as f:
-        json.dump(content, f)
-    if backend == ToolBackend.CLAUDE_CODE:
-        with open("claude.json.template") as f:
-            templ = f.read()
-        claude_json_path = get_claude_json_path(session_id)
-        with open(claude_json_path, 'w') as f:
-            f.write(templ)
+def get_agent_uploads_dir(working_dir: str, spawn_id: str) -> str:
+    return os.path.join(working_dir, ".codexmaster_uploads", spawn_id)
 
 
-def init_agent_codex_dir(session_id: str):
-    if NO_DOCKER:
-        return
-
-    # Create ~/.codex/codex-master/{session_id} subdir that looks like a fresh ~/.codex dir.
-    # Roughly corresponds to these commands:
-    #  mkdir -p ~/.codex/codex-master/{session_id}/sessions
-    #  cp ~/.codex/CODEX_MASTER_AGENTS.md ~/.codex/codex-master/{session_id}/AGENTS.md
-    agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
-    sessions_dir = os.path.join(agent_dir, "sessions")
-    os.makedirs(sessions_dir, exist_ok=True)
-    if CODEX_MASTER_AGENTS_MD_PATH is not None:
-        shutil.copy2(CODEX_MASTER_AGENTS_MD_PATH, os.path.join(agent_dir, "AGENTS.md"))
-
-
-def init_session_file(session_id: str, backend: str):
-    init_agent_codex_dir(session_id)
-    write_session_file(session_id, [], backend)
+def build_codex_prompt(user_prompt: str) -> str:
+    return f"{instructions}\n\nUser request:\n{user_prompt}"
 
 
 async def default_run_proc_and_wait_completion_waiter(proc: asyncio.subprocess.Process):
@@ -351,9 +360,30 @@ def get_auto_gen_env_vars() -> dict[str, str]:
     }
 
 
-async def create_agent_docker_container(spawn_id: str, session_id: str, working_dir: str, leak_env: bool = False, backend: str = ToolBackend.CODEX_HEADLESS):
+def is_docker_execution_mode(mode: str) -> bool:
+    return mode == "docker"
+
+
+def is_host_execution_mode(mode: str) -> bool:
+    return mode == "host"
+
+
+def normalize_agent_verbosity(verbosity: Optional[str]) -> str:
+    if verbosity is None:
+        return DEFAULT_AGENT_VERBOSITY
+    verbosity = str(verbosity).strip().lower()
+    if verbosity not in ("answers", "verbose"):
+        return DEFAULT_AGENT_VERBOSITY
+    return verbosity
+
+
+def is_verbose_agent_verbosity(verbosity: str) -> bool:
+    return normalize_agent_verbosity(verbosity) == "verbose"
+
+
+async def create_agent_docker_container(spawn_id: str, working_dir: str, leak_env: bool = False):
     log(
-        f"Creating agent container for {spawn_id} and mounting to {working_dir}. Session ID is {session_id}."
+        f"Creating agent container for {spawn_id} and mounting to {working_dir}."
         + (" WARNING: env leak enabled." if leak_env else "")
     )
     auto_gen_env_vars = get_auto_gen_env_vars()
@@ -365,19 +395,11 @@ async def create_agent_docker_container(spawn_id: str, session_id: str, working_
     if CODEX_ENV_FILE is not None:
         env_var_setters.extend(["--env-file", CODEX_ENV_FILE])
 
-    agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
     dot_codex_dir_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".codex")
-
     mounts = [
         "-v", f"{working_dir}:{working_dir}",
-        "-v", f"{agent_dir}:{dot_codex_dir_in_docker}",
+        "-v", f"{DOT_CODEX_DIR}:{dot_codex_dir_in_docker}",
     ]
-
-    if backend == ToolBackend.CLAUDE_CODE:
-        claude_json_path = get_claude_json_path(session_id)
-        claude_json_path_in_docker = os.path.join(auto_gen_env_vars["CODEX_HOME"], ".claude.json")
-        mounts.append("-v")
-        mounts.append(f"{claude_json_path}:{claude_json_path_in_docker}")
 
     docker_args = [
         "docker",
@@ -447,27 +469,22 @@ async def delete_agent_docker_container(spawn_id: str):
 async def launch_agent(
     spawn_id: str,
     prompt: str,
-    session_id: str,
+    codex_session_id: Optional[str],
     provider: str,
     model: str,
     working_dir: str,
     leak_env: bool = False,
-    backend: str = ToolBackend.CODEX_HEADLESS,
+    execution_mode: str = DEFAULT_EXECUTION_MODE,
 ):
     assert not leak_env or ALLOW_LEAK_ENV
+    codex_working_dir = working_dir
 
-    if NO_DOCKER:
-        log(f"Launching agent {spawn_id} WITHOUT docker...")
+    if is_host_execution_mode(execution_mode):
+        log(f"Launching agent {spawn_id} on host...")
         optional_docker_prefix = []
-        cli_script_abspath = os.path.join(BOT_WORKING_DIR, "third_party/codex-headless/dist/cli.mjs")
-        if leak_env:
-            proc_env = None
-        elif CODEX_ENV_FILE is not None:
-            proc_env = dotenv_values(CODEX_ENV_FILE)
-        else:
-            # Empty env dict might be interpreted as "inherit all"
-            proc_env = {"__ENV_LEAK_DISABLED": 1}
-    else:
+        proc_env = get_host_proc_env(leak_env)
+        subprocess_cwd = working_dir
+    elif is_docker_execution_mode(execution_mode):
         log(f"Launching agent {spawn_id} in docker container...")
         proc_env = None  # docker itself gets all host env vars
 
@@ -477,46 +494,43 @@ async def launch_agent(
         optional_docker_prefix = [
             "docker",
             "exec",
-        ] + ([
             "-i",  # leaves stdin open (required by codex cli even in quiet mode for whatever reason)
-        ] if backend == ToolBackend.CODEX_HEADLESS else []) + [
             # "-u", getpass.getuser(),
             get_docker_container_name(spawn_id),
         ]
-        cli_script_abspath = "/app/third_party/codex-headless/dist/cli.mjs"
-        working_dir = None  # launch docker itself in current working dir
-
-    log(f"Launching {backend}...")
-    if backend == ToolBackend.CODEX_HEADLESS:
-        args = optional_docker_prefix + [
-            "node", "--enable-source-maps",
-            cli_script_abspath,
-            "-q", prompt,
-            "--session-id", session_id,
-            # "--update-session-file", "false",
-            "--full-auto",
-            "--provider", provider,
-        ] + (["--model", model] if model != "default" else [])
-    elif backend == ToolBackend.CLAUDE_CODE:
-        args = optional_docker_prefix + [
-            "/usr/local/bin/claude",
-            "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--verbose",
-            "--output-format", "stream-json",
-            "--continue",
-        ] + (["--model", model] if model != "default" else [])
-    elif backend == ToolBackend.GEMINI_CLI:
-        sess_fp = os.path.expanduser("~/.gemini_session.json")
-        args = optional_docker_prefix + [
-            "/app/third_party/gemini-cli/bundle/gemini.js",
-            "-p", prompt,
-            "--session", sess_fp,
-            "--json",
-            "--yolo",
-        ] + (["--model", model] if model != "default" else [])
+        subprocess_cwd = None  # launch docker itself in current working dir
     else:
-        raise RuntimeError("unreachable")
+        raise RuntimeError(f"Unknown execution mode '{execution_mode}'")
+
+    codex_options = [
+        "--json",
+        "--skip-git-repo-check",
+        "--full-auto",
+    ]
+    if provider == "oss":
+        codex_options.append("--oss")
+    else:
+        codex_options.extend(["-c", f'model_provider="{provider}"'])
+    if model != "default":
+        codex_options.extend(["-m", model])
+
+    if codex_session_id:
+        args = optional_docker_prefix + [
+            "codex",
+            "exec",
+            "resume",
+            *codex_options,
+            codex_session_id,
+            prompt,
+        ]
+    else:
+        args = optional_docker_prefix + [
+            "codex",
+            "exec",
+            *codex_options,
+            "-C", codex_working_dir,
+            prompt,
+        ]
 
     log(f"launch_agent: running async command `{' '.join(args)}`")
     proc = await asyncio.create_subprocess_exec(
@@ -524,7 +538,7 @@ async def launch_agent(
         stdin=asyncio.subprocess.PIPE,  # leaves stdin open (required by codex cli even in quiet mode when running in docker for whatever reason)
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        cwd=working_dir,
+        cwd=subprocess_cwd,
         env=proc_env,
     )
     return proc
@@ -545,11 +559,22 @@ async def set_instructions(ctx: discord.ApplicationContext, new_instructions: st
 @option("working_dir", description="The working directory for the agent to work in")
 @option("provider", description="The Provider to use")
 @option("model", description="The model to use")
-@option("leak_env", description="If set to true, leaks the env vars from the host system into the Codex container")
+@option("execution_mode", choices=["docker", "host"], description="Run Codex in Docker or directly on the host")
+@option("verbosity", choices=["answers", "verbose"], description="Only answers+token usage, or include tool calls and thoughts")
+@option("leak_env", description="If set to true, leaks host environment variables into the Codex runtime")
 @option("allow_create_working_dir", description="If set to true, it will create the working dir if it does not exist")
-@option("backend", choices=["codex", "claude", "gemini"], description="Whether to use codex-headless or claude code as the underlying tool")
 @log_command_usage
-async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str, provider: str = DEFAULT_PROVIDER, model: str = "default", leak_env: bool = False, allow_create_working_dir: bool = True, backend: str = ToolBackend.CODEX_HEADLESS):
+async def spawn(
+    ctx: discord.ApplicationContext,
+    spawn_id: str,
+    working_dir: str,
+    provider: str = DEFAULT_PROVIDER,
+    model: str = "default",
+    execution_mode: str = DEFAULT_EXECUTION_MODE,
+    verbosity: str = DEFAULT_AGENT_VERBOSITY,
+    leak_env: bool = False,
+    allow_create_working_dir: bool = True,
+):
     """Registers a unique spawn ID that can be used for future prompts."""
     if spawn_id in spawns:
         await ctx.respond(
@@ -594,28 +619,29 @@ async def spawn(ctx: discord.ApplicationContext, spawn_id: str, working_dir: str
             f"❌ leak_env=True has been configured as disallowed."
         )
         return
-    if backend not in (ToolBackend.CODEX_HEADLESS, ToolBackend.CLAUDE_CODE, ToolBackend.GEMINI_CLI):
-        await ctx.respond(
-            f"❌ Unknown backend {backend}."
-        )
+    execution_mode = execution_mode.strip().lower()
+    if execution_mode not in ("docker", "host"):
+        await ctx.respond(f"❌ Unknown execution mode '{execution_mode}'.")
         return
-    if backend != ToolBackend.CODEX_HEADLESS and NO_DOCKER:
-        await ctx.respond(
-            f"❌ In NO_DOCKER mode, only the codex backend is supported."
-        )
+    if is_docker_execution_mode(execution_mode) and not ALLOW_DOCKER_EXECUTION:
+        await ctx.respond("❌ Docker execution has been disabled by configuration.")
         return
-    session_id = get_random_id()
-    init_session_file(session_id, backend)
-    if not NO_DOCKER:
-        await create_agent_docker_container(spawn_id, session_id, working_dir, leak_env, backend)
+    if is_host_execution_mode(execution_mode) and not ALLOW_HOST_EXECUTION:
+        await ctx.respond("❌ Host execution has been disabled by configuration.")
+        return
+    verbosity = normalize_agent_verbosity(verbosity)
+
+    if is_docker_execution_mode(execution_mode):
+        await create_agent_docker_container(spawn_id, working_dir, leak_env)
     spawns[spawn_id] = {
         "spawn_id": spawn_id,
-        "session_id": session_id,
+        "codex_session_id": None,
         "provider": provider,
         "model": model.strip(),
         "working_dir": working_dir,
+        "execution_mode": execution_mode,
+        "verbosity": verbosity,
         "leak_env": leak_env,
-        "backend": backend,
         "channel": ctx.channel,
         "user": ctx.author,
         "processes": []
@@ -663,12 +689,15 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
     if spawn_id not in spawns:
         await ctx.respond(f"❌ Unknown spawn ID **{spawn_id}**.")
         return
-    procs = spawns[spawn_id]["processes"]
+    entry = spawns[spawn_id]
+    procs = entry["processes"]
+    execution_mode = entry["execution_mode"]
+    use_docker = is_docker_execution_mode(execution_mode)
     if not procs:
         append_msg = "."
         if delete:
             append_msg = f" (permanently deleted agent **{spawn_id}**)."
-            if not NO_DOCKER:
+            if use_docker:
                 # Stop container (without printing a full-blown traceback if not running)
                 await stop_agent_docker_container(spawn_id, silent_errors=True)
                 await delete_agent_docker_container(spawn_id)
@@ -677,7 +706,7 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
         await ctx.respond(f"ℹ️  No active processes for spawn ID **{spawn_id}**" + append_msg)
         return
 
-    if not NO_DOCKER:
+    if use_docker:
         await stop_agent_docker_container(spawn_id)
 
     count = 0
@@ -698,9 +727,9 @@ async def kill_impl(ctx: discord.ApplicationContext, spawn_id: str, delete: bool
             newly_killed_procs.append(proc)
         count += 1
 
-    spawns[spawn_id]["processes"] = []
+    entry["processes"] = []
     if delete:
-        if not NO_DOCKER:
+        if use_docker:
             await delete_agent_docker_container(spawn_id)
         del spawns[spawn_id]
     save_spawns()
@@ -742,8 +771,10 @@ async def list_spawns(ctx: discord.ApplicationContext):
     lines: list[str] = []
     for sid, entry in spawns.items():
         procs = entry["processes"]
+        execution_mode = entry["execution_mode"]
+        verbosity = entry["verbosity"]
         if procs:
-            lines.append(f"**{sid}**:")
+            lines.append(f"**{sid}** ({execution_mode}, {verbosity}):")
             for item in procs:
                 p = item["proc"]
                 delta = now - item["start_time"]
@@ -758,7 +789,7 @@ async def list_spawns(ctx: discord.ApplicationContext):
                     elapsed = f"{s}s"
                 lines.append(f" • PID {p.pid} – running for {elapsed}")
         else:
-            lines.append(f"**{sid}**: no active processes")
+            lines.append(f"**{sid}** ({execution_mode}, {verbosity}): no active processes")
     await ctx.respond("\n".join(lines))
 
 
@@ -783,107 +814,143 @@ def format_command_output(msg: str) -> str:
     return format_code_block(msg)
 
 
-def rfind_nth(haystack: str, needle: str, nth: int) -> int:
-    idx = -1
-    n = 0
-    while n < nth:
-        idx = haystack[:idx].rfind(needle)
-        if idx == -1:
-            return -1
-        n += 1
-    return idx
+def extract_codex_session_id_from_event(event: dict) -> Optional[str]:
+    event_type = event.get("type")
+    if event_type == "thread.started":
+        thread_id = event.get("thread_id")
+        return thread_id if isinstance(thread_id, str) else None
+    return None
 
 
-def send_codex_notification(worker_entry: dict, msg: str, backend: str, message_backlog: list[str], reference=None):
-    action = ''
-    messages = [msg]
-    append_to_message_backlog = False
+def format_token_usage_summary(usage: dict) -> str:
+    input_tokens = usage.get("input_tokens")
+    cached_input_tokens = usage.get("cached_input_tokens")
+    output_tokens = usage.get("output_tokens")
+    reasoning_output_tokens = usage.get("reasoning_output_tokens")
+    total_tokens = usage.get("total_tokens")
+
+    parts = []
+    if isinstance(input_tokens, int):
+        parts.append(f"in={input_tokens}")
+    if isinstance(cached_input_tokens, int):
+        parts.append(f"cached_in={cached_input_tokens}")
+    if isinstance(output_tokens, int):
+        parts.append(f"out={output_tokens}")
+    if isinstance(reasoning_output_tokens, int):
+        parts.append(f"reasoning_out={reasoning_output_tokens}")
+    if isinstance(total_tokens, int):
+        parts.append(f"total={total_tokens}")
+
+    if not parts:
+        return format_code_block(json.dumps(usage, indent=2))
+    return "Tokens: " + ", ".join(parts)
+
+
+def format_codex_item_tool(item: dict) -> str:
+    item_type = str(item.get("type", "tool"))
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    action_type = str(action.get("type", "other"))
+
+    if item_type == "web_search":
+        if action_type == "search":
+            query = action.get("query") or item.get("query") or ""
+            return format_command(f'web_search "{query}"' if query else "web_search")
+        if action_type == "open_page":
+            url = action.get("url") or item.get("query") or ""
+            return format_command(f"web_open {url}" if url else "web_open")
+        query = item.get("query")
+        if isinstance(query, str) and query:
+            return format_command(f"web_search {query}")
+        return format_command("web_search")
+
+    if item_type in ("local_shell_call", "shell"):
+        cmd = item.get("command")
+        if isinstance(cmd, list):
+            return format_command(" ".join(map(str, cmd)))
+        if isinstance(cmd, str):
+            return format_command(cmd)
+
+    # Generic fallback for newer/unknown tool item types
+    minimal = {
+        "type": item.get("type"),
+        "id": item.get("id"),
+        "action": item.get("action"),
+        "query": item.get("query"),
+    }
+    return format_code_block(json.dumps(minimal, indent=2))
+
+
+def send_codex_notification(worker_entry: dict, event: dict, verbosity: str, reference=None):
+    action = ""
+    messages: list[str] = []
+    verbosity = normalize_agent_verbosity(verbosity)
+    verbose = is_verbose_agent_verbosity(verbosity)
+
     try:
-        content = json.loads(msg)
-        if backend == ToolBackend.GEMINI_CLI:
-            if content.get("callId"):
-                role = "user"
+        event_type = event.get("type")
+        if event_type == "error":
+            msg = event.get("message")
+            if isinstance(msg, str) and msg:
+                messages = [format_code_block(msg)]
+                action = " error"
             else:
-                role = content["candidates"][0]["content"]["role"]
-        else:
-            role = content.get("role", "unknown")
-        if backend == ToolBackend.GEMINI_CLI:
-            if "callId" in content:
-                resp = content["responseParts"]["functionResponse"]
-            else:
-                resp = content["candidates"][0]["content"]["parts"][0]
-            content_ty = "message"
-            if resp.get("thought", False):
-                content_ty = "reasoning"
-            elif resp.get("functionCall"):
-                # TODO this is a bit hacky, because this mapping of gemini cli to codex cli actions is not quite 1 to 1
-                content_ty = "local_shell_call"
-            elif content.get("callId"):
-                content_ty = "local_shell_call_output"
-
-            if content_ty != "message" and message_backlog:
-                action = ' responded'
-                send_notification(worker_entry, ''.join(message_backlog), reference=reference, action=action)
-                message_backlog.clear()
-            elif content_ty == "message":
-                append_to_message_backlog = True
-
-            if content_ty == "message":
-                messages = [format_response(resp['text'])]
-                action = ' responded'
-            elif content_ty == "reasoning":
-                messages = [format_thought(resp['text'])]
-                action = ' thought'
-            elif content_ty == "local_shell_call":
-                messages = [format_code_block(json.dumps(resp["functionCall"], indent=2))]
-                action = ' executed'
-            elif content_ty == "local_shell_call_output":
-                out_inner = resp["response"]["output"]
-                messages = [format_command_output(out_inner)]
-                action = ' got result'
-        else:
-            # This must be in the codex cli branch because 1. gemini cli does not print the user query and 2. functionResponse objects are role 'user' in gemini cli
-            if role == "user":
                 return
-            # TODO handle claude code properly
-            if "type" not in content:
-                raise RuntimeError("Missing attribute 'type'")
-            content_ty = content["type"]
-            if content_ty == "message":
-                assert 'content' in content
-                messages = [format_response(c['text']) for c in content['content']]
-                action = ' responded'
-            elif content_ty == "reasoning":
-                assert 'summary' in content
-                messages = [format_thought(c['text']) for c in content['summary']]
-                action = ' thought'
-            elif content_ty == "local_shell_call":
-                assert 'action' in content and 'command' in content['action']
-                messages = [format_command(' '.join(content['action']['command']))]
-                action = ' executed'
-            elif content_ty == "local_shell_call_output":
-                assert 'output' in content
-                out = content['output']
-                try:
-                    out = out.encode('utf-8').decode('unicode_escape')
-                    # You can't properly load `out`. It should be json, but it is not escaped, so we have to
-                    # hackily extract the content of the 'output' field.
-                    start = out.find(':') + 2
-                    end = rfind_nth(out, ',', 2) - 1
-                    out_inner = out[start:end]
-                except Exception:
-                    messages = [out]
+        elif event_type == "turn.failed":
+            err = event.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else None
+            if isinstance(msg, str) and msg:
+                messages = [format_code_block(msg)]
+                action = " error"
+            else:
+                return
+        elif event_type == "turn.completed":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                messages = [format_token_usage_summary(usage)]
+                action = " used tokens"
+            else:
+                return
+        elif event_type in ("item.started", "item.completed"):
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return
+            item_type = item.get("type")
+            item_completed = event_type == "item.completed"
+            if item_type == "agent_message":
+                if not item_completed:
+                    return
+                msg = item.get("text")
+                if isinstance(msg, str) and msg:
+                    messages = [format_response(msg)]
+                    action = " responded"
                 else:
-                    messages = [format_command_output(out_inner)]
-                action = ' got result'
+                    return
+            elif item_type == "reasoning":
+                if not (verbose and item_completed):
+                    return
+                msg = item.get("text")
+                if isinstance(msg, str) and msg:
+                    messages = [format_thought(msg)]
+                    action = " thought"
+                else:
+                    return
+            else:
+                if not verbose:
+                    return
+                messages = [format_codex_item_tool(item)]
+                action = " tool"
+                if not item_completed:
+                    action = " started tool"
+        elif event_type in ("thread.started", "turn.started", "turn.cancelled"):
+            return
+        else:
+            return
     except Exception:
         log(traceback.format_exc())
+        return
 
-    if append_to_message_backlog:
-        message_backlog.extend(messages)
-    else:
-        for m in messages:
-            send_notification(worker_entry, m, reference=reference, action=action)
+    for m in messages:
+        send_notification(worker_entry, m, reference=reference, action=action)
 
 
 def close_unterminated_code_blocks(s: str) -> str:
@@ -934,10 +1001,6 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
         coro = channel.send(msg_piece, reference=reference)
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
         is_first_iter = False
-
-
-def get_history_item_content(item: dict):
-    return item.get('content') or item.get('summary') or item.get('output') or item['action']['command']
 
 
 async def save_message_attachments(message, save_directory):
@@ -1036,39 +1099,46 @@ async def on_message(message: discord.Message):
     entry['user'] = message.author
     entry['channel'] = message.channel
 
-    session_id = entry['session_id']
-    provider = entry.get('provider', DEFAULT_PROVIDER).strip()
+    codex_session_id = entry["codex_session_id"]
+    provider = entry["provider"]
+    model = entry["model"]
+    working_dir = entry["working_dir"]
+    leak_env = entry["leak_env"]
+    execution_mode = entry["execution_mode"]
+    verbosity = entry["verbosity"]
     if provider not in ALLOWED_PROVIDERS:
-        provider = DEFAULT_PROVIDER
-    model = entry.get("model", DEFAULT_MODEL).strip()
-    backend = entry.get("backend", ToolBackend.CODEX_HEADLESS)
-    working_dir = entry.get("working_dir", DEFAULT_WORKING_DIR)
-    leak_env = entry.get("leak_env", False)
+        await message.channel.send(
+            f"❌ This agent uses provider '{provider}', which is not allowed by current bot config. Recreate the agent or update `ALLOWED_PROVIDERS`.",
+            reference=message
+        )
+        return
+    if is_docker_execution_mode(execution_mode) and not ALLOW_DOCKER_EXECUTION:
+        await message.channel.send("❌ This agent is configured for Docker, but Docker execution is disabled.", reference=message)
+        return
+    if is_host_execution_mode(execution_mode) and not ALLOW_HOST_EXECUTION:
+        await message.channel.send("❌ This agent is configured for host execution, but host execution is disabled.", reference=message)
+        return
+
+    prev_session_file_content = None
+    if codex_session_id:
+        prev_session_file_path = find_codex_session_file_path(codex_session_id)
+        if prev_session_file_path and os.path.exists(prev_session_file_path):
+            prev_session_file_content = read_text_file(prev_session_file_path)
 
     # Upload attachments and append `Uploaded attachments:\n- attachment1_path\n- attachment2_path\n...` to prompt
     if message.attachments:
-        agent_dir = os.path.join(CODEX_MASTER_DIR, session_id)
-        attachments_dir = os.path.join(agent_dir, "uploads")
+        attachments_dir = get_agent_uploads_dir(working_dir, spawn_id)
         log(f"Saving attachments to {attachments_dir}...")
-        await save_message_attachments(message, attachments_dir)
+        saved_files = await save_message_attachments(message, attachments_dir)
         log(f"Done saving attachments!")
         prompt += "\n\nUploaded attachments:"
-        for attachment in message.attachments:
-            safe_filename = secure_filename(attachment.filename)
-            filepath = safe_join(os.path.expanduser("~/.codex/uploads"), safe_filename)
+        for filepath in saved_files:
             prompt += f"\n- {filepath}"
 
     # Start the agent
-    proc = await launch_agent(spawn_id, prompt, session_id, provider, model, working_dir, leak_env, backend)
+    prompt = build_codex_prompt(prompt)
+    proc = await launch_agent(spawn_id, prompt, codex_session_id, provider, model, working_dir, leak_env, execution_mode)
     await message.channel.send(f"✅ AGENT **{spawn_id}** DEPLOYED...", reference=message)
-
-    sess_fp = get_session_file_path(session_id)
-    if not os.path.exists(sess_fp):
-        init_session_file(session_id, backend)
-    with open(sess_fp) as f:
-        sess = json.load(f)
-    prev_sess_items_og = deepcopy(sess['items'])
-    prev_sess_items = deepcopy(prev_sess_items_og)
 
     assert proc.stdout is not None
     entry["processes"].append({"proc": proc, "start_time": datetime.datetime.now()})
@@ -1081,20 +1151,11 @@ async def on_message(message: discord.Message):
         reference = message
 
     async def reader():
+        nonlocal codex_session_id
         log(f"Spawning reader routine for agent {spawn_id}")
-
-        notifications: list[dict] = []
-        message_backlog: list[str] = []  # used for buffering chunked gemini CLI responses and sending them as one message
         async for line in proc.stdout:
-            line = line.strip().decode('utf-8')
+            line = line.strip().decode('utf-8', errors='replace')
             if not line:
-                if backend == ToolBackend.GEMINI_CLI and message_backlog:
-                    # Gemini CLI has a chunking mechanism where it sends it's responses in multiple chunks.
-                    # We buffer these chunks into a single message.
-                    # If we see a newline, we send and clear the backlog
-                    action = ' responded'
-                    send_notification(entry, ''.join(message_backlog), reference=reference, action=action)
-                    message_backlog.clear()
                 continue
             try:
                 line_json = json.loads(line)
@@ -1102,49 +1163,36 @@ async def on_message(message: discord.Message):
                 log("[ERROR] New line from process:", line)
                 log(traceback.format_exc())
                 continue
-            notifications.append(line_json)
-
-            # Ignore messages that were part of the session file (that will be re-printed) by
-            # matchig their content against what is printed (not all will be printed for some reason).
-            # This assumes that all messages that will be printed (up until the new user message) are
-            # part of the session file as well. NOTE: This behavior is Codex-only.
-            ignore_this = False
-            while prev_sess_items and backend == ToolBackend.CODEX_HEADLESS:
-                prev_item = prev_sess_items.pop(0)
-                prev_content = get_history_item_content(prev_item)
-                content = get_history_item_content(line_json)
-                if content == prev_content:
-                    ignore_this = True
-                    log("[IGNORED] New line from process:", line)
-                    break
-            if ignore_this:
-                continue
 
             log("New line from process:", line)
+            maybe_session_id = extract_codex_session_id_from_event(line_json)
+            if maybe_session_id and maybe_session_id != codex_session_id:
+                codex_session_id = maybe_session_id
+                entry["codex_session_id"] = maybe_session_id
+                save_spawns()
 
-            send_codex_notification(entry, line, backend, message_backlog, reference=reference)
+            send_codex_notification(entry, line_json, verbosity=verbosity, reference=reference)
 
         # Send termination notification
         send_notification(entry, f"AGENT **{spawn_id}** COMPLETED HIS MISSION!", critical=True, reference=reference)
         log(f"Retiring reader routine for agent {spawn_id}")
 
         # Stop container
-        if not NO_DOCKER:
+        if is_docker_execution_mode(execution_mode):
             await stop_agent_docker_container(spawn_id)
 
         await proc.wait()
-
-        # Overwrite the auto-updated sessions file manually to remove messages the cli ignores.
-        # Example: empty reasoning summary messages.
-        # However, revert content if we were killed.
         if proc in newly_killed_procs:
-            log(f"Reverting session file for ID {session_id}")
+            log(f"Reverting session file for Codex session ID {codex_session_id}")
             newly_killed_procs.remove(proc)
-            write_session_file(session_id, prev_sess_items_og, backend)
-        else:
-            log(f"Updating session file for ID {session_id}")
-            write_session_file(session_id, notifications, backend)
-        
+            restored = restore_codex_session_file(codex_session_id, prev_session_file_content)
+            if not restored:
+                log(f"Could not restore session file for {codex_session_id}")
+            if prev_session_file_content is None:
+                # First run was reverted; drop the stored session id so the next prompt starts fresh.
+                entry["codex_session_id"] = None
+                save_spawns()
+
         # Remove this process from entry["processes"]
         entry_procs = entry["processes"]
         for i in range(len(entry_procs)):
@@ -1161,7 +1209,4 @@ if __name__ == "__main__":
     if not token:
         log("Error: DISCORD_BOT_TOKEN environment variable not set.")
         sys.exit(1)
-    if CLEAN_ALL_BACKUPS_CRONJOB_PERIOD > 0:
-        threading.Thread(target=clean_backups_cronjob).start()
     bot.run(token)
-

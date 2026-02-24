@@ -55,26 +55,13 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# No need to install claude code using NPM because we provide our own modded version
-RUN npm install -g @anthropic-ai/claude-code@1.0.31
+# Install standard Codex CLI
+RUN npm install -g @openai/codex
 
 # Create and activate venv and install dependencies
 RUN mkdir -p /app
 RUN python3 -m venv /app/.venv
 RUN bash -c "source /app/.venv/bin/activate && pip install pydantic_extra_types==2.10.3 pydantic==2.10.6 mcp==1.3.0 tzdata==2025.1 openai==1.66.2 typer==0.15.2"
-
-# Copy and build the gemini-cli part
-COPY ./third_party/gemini-cli /app/third_party/gemini-cli
-RUN chmod +x /app/third_party/gemini-cli/bundle.sh
-RUN bash -lc "cd /app/third_party/gemini-cli && ./bundle.sh && cd -"
-
-# Copy the dist folder for codex-headless
-COPY ./third_party/codex-headless/dist/ /app/third_party/codex-headless/dist/
-RUN chmod +x /app/third_party/codex-headless/dist/bin/codex-linux-sandbox-x64
-RUN chmod +x /app/third_party/codex-headless/dist/bin/codex-linux-sandbox-arm64
-RUN chmod +x /app/third_party/codex-headless/dist/cli.mjs
-COPY ./third_party/claude-code-unrestricted/claude /usr/local/bin/claude
-RUN chmod +x /usr/local/bin/claude
 
 # Copy custom tools for Codex (python scripts invoked through terminal).
 # No extension so it can be called like `web_search -q "query"`

@@ -29,9 +29,10 @@ All commands below are invoked as Discord application (slash) commands. Only use
 | working_dir              | string  | The working directory for the agent to operate in                      | _required_        |
 | provider                 | string  | The provider to use (must be one of `ALLOWED_PROVIDERS`)                | openai            |
 | model                    | string  | The model to use                                                       | codex-mini-latest |
-| leak_env                 | boolean | Leak host environment variables into the container if allowed          | false             |
+| execution_mode           | string  | Where to run Codex for this agent (`docker` or `host`)                 | `DEFAULT_EXECUTION_MODE` |
+| verbosity                | string  | `answers` (responses + token usage) or `verbose` (also thoughts/tools) | `DEFAULT_AGENT_VERBOSITY` |
+| leak_env                 | boolean | Leak host environment variables into the Codex runtime if allowed      | false             |
 | allow_create_working_dir | boolean | If set to true, it will create the working dir if it does not exist      | true              |
-| backend                  | string  | Whether to use codex-headless, claude code or gemini cli as the underlying tool | codex-headless    |
 
 ### `/set_provider`
 **Description:** Change the provider for an existing Agent.

@@ -71,6 +71,7 @@ MAX_RAM_USAGE_GB = float(os.getenv("MAX_RAM_USAGE_GB", 4.0))
 DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = int(os.getenv("DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND", False))
 DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK = int(os.getenv("DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK", False))
 DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT = int(os.getenv("DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT", False))
+ATTACHMENTS_DIR = "/tmp/attachments"
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="", intents=intents)
@@ -185,6 +186,7 @@ instructions = "You are Codex, a highly autonomous AI coding agent that lives in
 
 DOT_CODEX_DIR = os.path.expanduser("~/.codex")
 os.makedirs(DOT_CODEX_DIR, exist_ok=True)
+os.makedirs(ATTACHMENTS_DIR, exist_ok=True)
 
 
 def log(*args, **kwargs):
@@ -324,10 +326,6 @@ def get_host_proc_env(leak_env: bool) -> Optional[dict[str, str]]:
     return env
 
 
-def get_agent_uploads_dir(working_dir: str, spawn_id: str) -> str:
-    return os.path.join(working_dir, ".codexmaster_uploads", spawn_id)
-
-
 def build_codex_prompt(user_prompt: str) -> str:
     return f"{instructions}\n\nUser request:\n{user_prompt}"
 
@@ -420,6 +418,7 @@ async def create_agent_docker_container(spawn_id: str, working_dir: str, leak_en
     mounts = [
         "-v", f"{working_dir}:{working_dir}",
         "-v", f"{DOT_CODEX_DIR}:{dot_codex_dir_in_docker}",
+        "-v", f"{ATTACHMENTS_DIR}:{ATTACHMENTS_DIR}",
     ]
 
     docker_args = [
@@ -1034,13 +1033,13 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
 
 
 async def save_message_attachments(message, save_directory):
-    """Save all attachments from a Discord message"""
+    """Save all attachments from a Discord message and return saved file paths."""
 
     # Create directory if it doesn't exist
     os.makedirs(save_directory, exist_ok=True)
 
     if not message.attachments:
-        print("No attachments found")
+        log("No attachments found")
         return []
 
     saved_files = []
@@ -1056,12 +1055,11 @@ async def save_message_attachments(message, save_directory):
                 # Use safe_join to prevent directory traversal
                 filepath = safe_join(save_directory, safe_filename)
                 if filepath is None:
-                    print(f"Unsafe path detected for {attachment.filename}, skipping")
+                    log(f"Unsafe path detected for {attachment.filename}, skipping")
                     continue
 
                 # Handle duplicates
                 counter = 1
-                original_filepath = filepath
                 while os.path.exists(filepath):
                     name, ext = os.path.splitext(safe_filename)
                     duplicate_filename = f"{name}_{counter}{ext}"
@@ -1071,7 +1069,7 @@ async def save_message_attachments(message, save_directory):
                     counter += 1
 
                 if filepath is None:
-                    print(f"Could not create safe path for {attachment.filename}")
+                    log(f"Could not create safe path for {attachment.filename}")
                     continue
 
                 # Download the file
@@ -1082,12 +1080,12 @@ async def save_message_attachments(message, save_directory):
                                 await f.write(chunk)
 
                         saved_files.append(filepath)
-                        print(f"Saved: {os.path.basename(filepath)} ({attachment.size} bytes)")
+                        log(f"Saved: {os.path.basename(filepath)} ({attachment.size} bytes)")
                     else:
-                        print(f"Failed to download {attachment.filename}: HTTP {response.status}")
+                        log(f"Failed to download {attachment.filename}: HTTP {response.status}")
 
             except Exception as e:
-                print(f"Error saving {attachment.filename}: {e}")
+                log(f"Error saving {attachment.filename}: {e}")
 
     return saved_files
 
@@ -1156,15 +1154,18 @@ async def on_message(message: discord.Message):
         if prev_session_file_path and os.path.exists(prev_session_file_path):
             prev_session_file_content = read_text_file(prev_session_file_path)
 
-    # Upload attachments and append `Uploaded attachments:\n- attachment1_path\n- attachment2_path\n...` to prompt
+    # Save attachments into /tmp/attachments and append a notice to the prompt.
     if message.attachments:
-        attachments_dir = get_agent_uploads_dir(working_dir, spawn_id)
+        attachments_dir = ATTACHMENTS_DIR
         log(f"Saving attachments to {attachments_dir}...")
         saved_files = await save_message_attachments(message, attachments_dir)
         log(f"Done saving attachments!")
-        prompt += "\n\nUploaded attachments:"
-        for filepath in saved_files:
-            prompt += f"\n- {filepath}"
+        if saved_files:
+            attached_filenames = ", ".join(os.path.basename(filepath) for filepath in saved_files)
+            prompt += (
+                f"\n\nThis message contains attachments, which are accessible in {ATTACHMENTS_DIR}. "
+                f"The attached files are: {attached_filenames}."
+            )
 
     # Start the agent
     prompt = build_codex_prompt(prompt)

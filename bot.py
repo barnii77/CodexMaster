@@ -72,6 +72,9 @@ DISCORD_RESPONSE_NO_REFERENCE_USER_COMMAND = int(os.getenv("DISCORD_RESPONSE_NO_
 DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK = int(os.getenv("DISCORD_LONG_RESPONSE_BULK_AS_CODEBLOCK", False))
 DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT = int(os.getenv("DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT", False))
 ATTACHMENTS_DIR = "/tmp/attachments"
+ATTACHMENT_SEND_INSTRUCTION_NEW_CHAT = 'To send me attachments, put <!attach>("filepath") in your response'
+ATTACHMENT_SEND_INSTRUCTION_REMINDER = 'Remember, to send me attachments, put <!attach>("filepath") in your response'
+ATTACHMENT_SEND_INSTRUCTION_INTERVAL = 10
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="", intents=intents)
@@ -143,6 +146,9 @@ def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
         raise ValueError("codex_session_id must be null or string")
     if not isinstance(entry["processes"], list):
         raise ValueError("processes must be a list")
+    chat_message_count = entry.get("chat_message_count", 0)
+    if isinstance(chat_message_count, bool) or not isinstance(chat_message_count, int) or chat_message_count < 0:
+        raise ValueError("chat_message_count must be a non-negative integer")
 
     # Persisted files should not contain live process handles; ensure we start empty.
     entry["processes"] = []
@@ -151,6 +157,7 @@ def normalize_persisted_spawn(spawn_id: str, entry: dict) -> dict:
     entry["provider"] = entry["provider"].strip()
     entry["model"] = entry["model"].strip()
     entry["leak_env"] = bool(entry["leak_env"])
+    entry["chat_message_count"] = chat_message_count
     return entry
 
 
@@ -671,7 +678,8 @@ async def spawn(
         "leak_env": leak_env,
         "channel": ctx.channel,
         "user": ctx.author,
-        "processes": []
+        "processes": [],
+        "chat_message_count": 0,
     }
     save_spawns()
     await ctx.respond(
@@ -1135,6 +1143,9 @@ async def on_message(message: discord.Message):
     leak_env = entry["leak_env"]
     execution_mode = entry["execution_mode"]
     verbosity = entry["verbosity"]
+    chat_message_count = entry.get("chat_message_count", 0)
+    if isinstance(chat_message_count, bool) or not isinstance(chat_message_count, int) or chat_message_count < 0:
+        chat_message_count = 0
     if provider not in ALLOWED_PROVIDERS:
         await message.channel.send(
             f"❌ This agent uses provider '{provider}', which is not allowed by current bot config. Recreate the agent or update `ALLOWED_PROVIDERS`.",
@@ -1166,6 +1177,14 @@ async def on_message(message: discord.Message):
                 f"\n\nThis message contains attachments, which are accessible in {ATTACHMENTS_DIR}. "
                 f"The attached files are: {attached_filenames}."
             )
+
+    if codex_session_id is None:
+        chat_message_count = 0
+        prompt += f"\n\n{ATTACHMENT_SEND_INSTRUCTION_NEW_CHAT}"
+    elif chat_message_count > 0 and chat_message_count % ATTACHMENT_SEND_INSTRUCTION_INTERVAL == 0:
+        prompt += f"\n\n{ATTACHMENT_SEND_INSTRUCTION_REMINDER}"
+    entry["chat_message_count"] = chat_message_count + 1
+    save_spawns()
 
     # Start the agent
     prompt = build_codex_prompt(prompt)

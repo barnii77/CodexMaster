@@ -1,4 +1,5 @@
 .env
+.env.disabled
 codex.env
 .venv
 spawns.json

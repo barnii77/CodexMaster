@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import ast
 import asyncio
 import sys
 import traceback
@@ -75,6 +76,9 @@ ATTACHMENTS_DIR = "/tmp/attachments"
 ATTACHMENT_SEND_INSTRUCTION_NEW_CHAT = 'To send me attachments, put <!attach>("filepath") in your response'
 ATTACHMENT_SEND_INSTRUCTION_REMINDER = 'Remember, to send me attachments, put <!attach>("filepath") in your response'
 ATTACHMENT_SEND_INSTRUCTION_INTERVAL = 10
+ATTACH_DIRECTIVE_PATTERN = re.compile(
+    r"""<!attach>\(\s*(?P<quoted>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*\)"""
+)
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="", intents=intents)
@@ -917,6 +921,62 @@ def format_codex_item_tool(item: dict) -> str:
     return format_code_block(json.dumps(minimal, indent=2))
 
 
+def extract_attachment_directives(text: str) -> tuple[str, list[str], list[str]]:
+    attachment_paths: list[str] = []
+    errors: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        quoted = match.group("quoted")
+        try:
+            parsed = ast.literal_eval(quoted)
+        except Exception:
+            errors.append(f"Invalid attachment directive argument: {quoted}")
+            return ""
+        if not isinstance(parsed, str):
+            errors.append("Attachment path must be a string.")
+            return ""
+        parsed = parsed.strip()
+        if not parsed:
+            errors.append("Attachment path must not be empty.")
+            return ""
+        attachment_paths.append(parsed)
+        return ""
+
+    cleaned = ATTACH_DIRECTIVE_PATTERN.sub(_replace, text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, attachment_paths, errors
+
+
+def resolve_attachment_paths(worker_entry: dict, attachment_paths: list[str]) -> tuple[list[str], list[str]]:
+    working_dir = worker_entry.get("working_dir")
+    if not isinstance(working_dir, str) or not working_dir:
+        working_dir = os.getcwd()
+
+    resolved_files: list[str] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for path in attachment_paths:
+        candidate = os.path.expanduser(path)
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(working_dir, candidate)
+        candidate = os.path.abspath(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        if not os.path.exists(candidate):
+            errors.append(f"Attachment not found: {candidate}")
+            continue
+        if not os.path.isfile(candidate):
+            errors.append(f"Attachment is not a file: {candidate}")
+            continue
+        if not os.access(candidate, os.R_OK):
+            errors.append(f"Attachment not readable: {candidate}")
+            continue
+        resolved_files.append(candidate)
+    return resolved_files, errors
+
+
 def send_codex_notification(worker_entry: dict, event: dict, verbosity: str, reference=None):
     action = ""
     messages: list[str] = []
@@ -987,7 +1047,25 @@ def send_codex_notification(worker_entry: dict, event: dict, verbosity: str, ref
         return
 
     for m in messages:
-        send_notification(worker_entry, m, reference=reference, action=action)
+        attachment_paths: list[str] = []
+        if action == " responded":
+            m, attachment_paths, parse_errors = extract_attachment_directives(m)
+            if parse_errors:
+                parse_errors_text = "\n".join(f"- {err}" for err in parse_errors)
+                m = (
+                    f"{m}\n\nAttachment directive errors:\n{parse_errors_text}"
+                    if m
+                    else f"Attachment directive errors:\n{parse_errors_text}"
+                )
+            if attachment_paths and not m:
+                m = "(sent attachments)"
+        send_notification(
+            worker_entry,
+            m,
+            reference=reference,
+            action=action,
+            attachment_paths=attachment_paths,
+        )
 
 
 def close_unterminated_code_blocks(s: str) -> str:
@@ -1017,14 +1095,33 @@ def close_unterminated_code_blocks(s: str) -> str:
     return s
 
 
-def send_notification(worker_entry: dict, notification: str, critical: bool = False, reference=None, action=''):
+def send_notification(
+    worker_entry: dict,
+    notification: str,
+    critical: bool = False,
+    reference=None,
+    action='',
+    attachment_paths: Optional[list[str]] = None,
+):
     channel, user_id, spawn_id = worker_entry["channel"], worker_entry["user"].id, worker_entry["spawn_id"]
     ping = f"<@{user_id}> " if critical else ""
+
+    resolved_attachments: list[str] = []
+    attachment_errors: list[str] = []
+    if attachment_paths:
+        resolved_attachments, attachment_errors = resolve_attachment_paths(worker_entry, attachment_paths)
+    if attachment_errors:
+        attachment_errors_text = "\n".join(f"- {err}" for err in attachment_errors)
+        notification = (
+            f"{notification}\n\nAttachment errors:\n{attachment_errors_text}"
+            if notification
+            else f"Attachment errors:\n{attachment_errors_text}"
+        )
 
     msg = f"{ping}**{spawn_id}**{action}:\n{notification}"
 
     is_first_iter = True
-    while msg:
+    while msg or resolved_attachments:
         msg_piece = close_unterminated_code_blocks(msg[:DISCORD_CHARACTER_LIMIT]) + (
             f"\n\n... ({len(msg[DISCORD_CHARACTER_LIMIT:].splitlines())} lines left)"
             if DISCORD_LONG_RESPONSE_ADD_NUM_LINES_LEFT and len(msg) >= DISCORD_CHARACTER_LIMIT
@@ -1035,7 +1132,18 @@ def send_notification(worker_entry: dict, notification: str, critical: bool = Fa
             # Put the bulk of long messages into code blocks
             msg_piece = f"```\n{msg_piece}\n```"
 
-        coro = channel.send(msg_piece, reference=reference)
+        kwargs = {"reference": reference}
+        if resolved_attachments:
+            attachment_batch_paths = resolved_attachments[:10]
+            resolved_attachments = resolved_attachments[10:]
+            kwargs["files"] = [
+                discord.File(fp=attachment_path, filename=os.path.basename(attachment_path))
+                for attachment_path in attachment_batch_paths
+            ]
+            if not msg_piece:
+                msg_piece = f"{ping}**{spawn_id}**{action}:"
+
+        coro = channel.send(msg_piece, **kwargs)
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
         is_first_iter = False
 
